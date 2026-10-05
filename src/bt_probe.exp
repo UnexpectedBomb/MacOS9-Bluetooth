@@ -1,0 +1,8 @@
+TheUSBDriverDescription
+TheClassDriverPluginDispatchTable
+BTScanStart
+BTSetRadio
+BTDeleteBond
+BTNoop
+BTNoopSIH
+kProbeGateMarker

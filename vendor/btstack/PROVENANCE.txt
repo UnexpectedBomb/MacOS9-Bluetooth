@@ -1,0 +1,4 @@
+BTstack v1.8.2
+commit 075a0780f0fad7ff67d58ac19f46e8953656a752
+vendored 2026-08-31, src/ tree and LICENSE only
+See ../BTSTACK-PIN.md

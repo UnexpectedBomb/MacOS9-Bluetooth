@@ -1,0 +1,60 @@
+# BTstack v1.8.2 (075a0780f0fa) -- the files this port compiles.
+#
+# !! THIS FILE MUST STAY PURE ASCII. CMake reads it with file(STRINGS), which
+# extracts printable-ASCII runs and treats any other byte as a SEPARATOR. An
+# em-dash in a comment here split the line, the fragment no longer began with #,
+# and CMake tried to compile "the files this port compiles." as a source file.
+#
+# Explicit, never a wildcard. An accidental new dependency should show up as a
+# link error or as an unclassified symbol in the audit, not as a silent expansion
+# of how much third-party code runs below task level.
+#
+# Derived from BTstack's own example/Makefile.inc lists (CORE, COMMON, CLASSIC),
+# trimmed to Classic HID: no BLE, no security manager, no crypto, no audio.
+#
+# Blank lines and # comments are ignored by readers of this file.
+
+# ---- CORE: memory, lists, run loop, utilities -----------------------------
+src/btstack_memory.c
+src/btstack_linked_list.c
+src/btstack_memory_pool.c
+src/btstack_run_loop.c
+# src/btstack_run_loop_base.c   REMOVED: in v1.8.2 this is a 228-byte deprecated
+#   stub and its header says "integrated into btstack_run_loop.h". The
+#   btstack_run_loop_base_* helpers this port calls live in btstack_run_loop.c,
+#   which is already listed above.
+src/btstack_util.c
+
+# ---- COMMON: HCI and L2CAP ------------------------------------------------
+# hci.c is BTstack's own HCI state machine. At M2 it REPLACES the bring-up
+# sequence in our src/hci.c, which becomes purely a transport shim. The two
+# cannot both drive the controller.
+src/hci.c
+src/hci_cmd.c
+src/hci_event.c
+src/hci_event_builder.c
+src/hci_dump.c
+src/l2cap.c
+src/l2cap_signaling.c
+src/ad_parser.c
+
+# ---- CLASSIC: SDP client and the HID host (M4) ----------------------------
+src/btstack_hid_parser.c
+src/classic/sdp_util.c
+src/classic/sdp_client.c
+src/classic/hid_host.c
+
+# ---- DELIBERATELY EXCLUDED, with reasons ----------------------------------
+# src/ble/*                 this is Classic HID, not LE
+# src/sm.c                  Security Manager is LE pairing; Classic pairing is in hci.c
+# src/btstack_crypto.c      pulled in by sm.c only
+# src/3rd-party/**/uECC.c   elliptic curve, for LE Secure Connections
+# src/btstack_audio.c       SCO audio; HID needs none
+# src/btstack_tlv*.c        persistent storage of link keys -- REVISIT at M3,
+#                           because remembering a pairing across reboots will
+#                           want it, and it implies non-volatile storage we do
+#                           not have a plan for yet
+# src/classic/sdp_server.c  we are an SDP client, not a server
+# src/classic/rfcomm.c      serial profile, not HID
+# platform/embedded/*       its run loop sleeps and expects a task-level while
+#                           loop; we supply our own. See docs/M2-DESIGN.md

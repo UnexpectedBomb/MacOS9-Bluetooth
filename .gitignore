@@ -1,0 +1,16 @@
+build/
+.DS_Store
+
+# ⚠⚠ NEVER COMMIT THESE. Purged from history 2026-09-23 before this repo went
+# public. logs/ carry real Bluetooth device addresses; docs/source/ holds captured
+# system state -- Apple System Profiler reports and ioreg dumps with the machine's
+# hardware serial number. Both are kept locally and backed up; neither belongs on
+# GitHub. Re-adding either is how the purge gets silently undone.
+logs/
+docs/source/
+
+# ⚠⚠ THE SCRUB LIST ITSELF. .scrub-identifiers holds the REAL device addresses that
+# sync-to-github.sh scans the public export FOR. A scanner must never publish the thing
+# it scans for, so the list is gitignored exactly as airport-extreme does it. It is
+# kept locally and in the Pi backup bundles; it is not in any repo.
+.scrub-identifiers
