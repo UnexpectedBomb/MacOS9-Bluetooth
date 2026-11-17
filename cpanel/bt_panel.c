@@ -208,7 +208,7 @@ static Boolean  MailboxCaughtUp(void);
  * so it drifted to v8.1 (with a comment saying 'v650') across two driver versions
  * without consequence. BTCheck's copy of the same idea is live and now CMake-guarded;
  * this one is a decoy. Do not start using it without the guard. */
-#define kExpectedDriverTag 0x76493630UL   /* 'vI60' = driver v18.6 */
+#define kExpectedDriverTag 0x76493730UL   /* 'vI70' = driver v18.7 */
 
 /* ★★★★★★ THE SWITCHER'S OWN BLOCK, AND WHY THE PANEL NOW READS IT.
  *

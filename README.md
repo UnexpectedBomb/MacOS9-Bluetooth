@@ -64,14 +64,15 @@ Sleep Assistant. It was tested with the internal module; with a DBT-120 it is un
 
 | file | version | goes in | what it does |
 |---|---|---|---|
-| `USB Bluetooth Support` | 18.6 | Extensions | the driver: USB transport, HCI, L2CAP, HID host, input injection |
+| `USB Bluetooth Support` | 18.7 | Extensions | the driver: USB transport, HCI, L2CAP, HID host, input injection |
 | `USBBluetoothSwitch` | 1.7 | Extensions | takes the internal A1044 module out of HID-proxy mode so the stack can own it. Not needed with a DBT-120 |
 | `Bluetooth` | 19.8 | Control Panels | scan, pair, delete, disconnect, rename; per-device details; the wake option |
 | `Bluetooth Strip` | 2.7 | Control Strip Modules | battery gauge, device switching, quick access |
-| `BTCheck` | 99.110 | anywhere | **strictly optional.** A diagnostic that writes a log rather than making you read a window. The stack does not need it and never calls it: install it only if something is wrong and you want to see why, or if you are reporting a problem. |
+| `BTCheck` | 99.111 | anywhere | **strictly optional.** A diagnostic that writes a log rather than making you read a window. The stack does not need it and never calls it: install it only if something is wrong and you want to see why, or if you are reporting a problem. |
 
-Every file's Get Info names the release it came from (`OS 9 Bluetooth 18.6`), and Extensions
-Manager and Apple System Profiler show the same in their Package column.
+Every file's Get Info names the release it came from, and Extensions Manager and Apple System
+Profiler show the same in their Package column: `OS 9 Bluetooth 18.7` for the driver and
+BTCheck, `OS 9 Bluetooth 18.6` for the three files 18.7 did not change.
 
 ⚠ Keep the extension named **`USB Bluetooth Support`**. The Mac OS USB Expert scans only
 Extensions files whose name begins "USB", so renaming it stops the driver loading, with no

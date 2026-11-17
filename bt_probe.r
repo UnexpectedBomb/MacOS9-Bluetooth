@@ -52,13 +52,17 @@ resource 'cfrg' (0) {
  * than remembered (it used to enforce "Bluetooth Support <ver> - "). Its --release
  * option moves "OS 9 Bluetooth <release>" in all five .r files of the stack at once. */
 resource 'vers' (1) {
-    0x18, 0x60, finalStage, 0x00, verUS,
-    "18.6",
-    "18.6"
+    0x18, 0x70, finalStage, 0x00, verUS,
+    "18.7",
+    "18.7"
 };
 
+/* ★ RELEASE 18.7 (user, 2026-11-17): the driver and BTCheck only. The panel, strip and
+ * switcher did not change and keep "OS 9 Bluetooth 18.6" -- the release each of them came
+ * from, as Apple's own updates left untouched files naming the older package. So until
+ * the next five-file release, bump-version.py reports this as two release names. */
 resource 'vers' (2) {
-    0x18, 0x60, finalStage, 0x00, verUS,
-    "18.6",
-    "OS 9 Bluetooth 18.6"
+    0x18, 0x70, finalStage, 0x00, verUS,
+    "18.7",
+    "OS 9 Bluetooth 18.7"
 };

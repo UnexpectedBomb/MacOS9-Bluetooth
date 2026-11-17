@@ -64,3 +64,10 @@ and are hardware-validated. Events and ACL come back up through the registered
 handler, called from our two USL completions.
 
 **The run loop is the architectural problem.** See `docs/M2-DESIGN.md`.
+
+## Local patches
+
+The vendored source is this pin **plus the local patches recorded in
+`btstack/CLAUDE-OS9-PATCHES.md`**, each marked in the source with the token
+`claude-os9 PATCH` (`grep -rn 'claude-os9 PATCH' vendor/btstack/src/`). A re-pin has to
+carry each one forward deliberately, or drop it with a reason.

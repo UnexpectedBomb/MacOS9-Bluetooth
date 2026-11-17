@@ -2083,7 +2083,19 @@ static void BhRecordReport(unsigned long cid,
                  *
                  * ⚠ Same pointer hazard as before -- hid_host.c stores `connection->
                  * report = report` and sends from a later callback -- so `led` stays
-                 * static. Do not make it a local. */
+                 * static. Do not make it a local.
+                 *
+                 * ★★★ capsled1 (2026-11-17): WHY 18.6's LED WENT DARK, AND WHERE THE FIX IS.
+                 * hid_host_send_report refuses with 0x0C COMMAND_DISALLOWED unless the
+                 * connection is ESTABLISHED, and upstream hid_host held every INCOMING
+                 * connection out of ESTABLISHED until an SDP query for its descriptor
+                 * completed -- a query sdp_client.c never times out. Measured on 18.6: one
+                 * session where it never completed, 11 LED writes all refused 0x0C, the
+                 * battery query refused too, typing fine throughout. The fix is NOT here:
+                 * it is the local patch in vendor/btstack/src/classic/hid_host.c, which
+                 * keeps an incoming connection ESTABLISHED from the moment both channels
+                 * open (Tiger's order). This call is unchanged on purpose -- it is the
+                 * exact route that lit the lamp on 11.8 and 13.7. */
                 gLedRc = 0x100UL | (unsigned long)hid_host_send_report(
                     (uint16_t)gBhCid, 1, &led, 1);
             }
@@ -3984,7 +3996,13 @@ static void hid_host_evt_handler(uint8_t type, uint16_t ch, uint8_t *packet,
          * PSM 0x11 by itself -- it asks us, which is where a host chooses BOOT or
          * REPORT. REPORT is where the A1016's byte 8 lives (Eject, Mute, Volume) per
          * docs/A1016-REPORT-DESCRIPTOR.md, so this single argument is what v8.6's
-         * hand-rolled SET_PROTOCOL(0x71) existed to achieve. */
+         * hand-rolled SET_PROTOCOL(0x71) existed to achieve.
+         *
+         * ★ capsled1 (2026-11-17): after this accept, hid_host no longer queries the
+         * device's SDP record before treating the connection as ready -- a local patch in
+         * vendor/btstack/src/classic/hid_host.c (see vendor/btstack/CLAUDE-OS9-PATCHES.md). SET_PROTOCOL
+         * (REPORT) goes out as soon as both channels open, Tiger's order. A query that
+         * never completed left 18.6's keyboard refusing every LED write. */
         gBhIncoming++;
         /* ★★★★★★ v15.0: ONE IDENTITY, TWO DEVICES. gBhCid / gBhPeerAddr / gBhLive are
          * THE KEYBOARD'S, and four separate consumers read them as "the connection":
@@ -4347,6 +4365,12 @@ static void hid_host_evt_handler(uint8_t type, uint16_t ch, uint8_t *packet,
         break;
 
     case HID_SUBEVENT_DESCRIPTOR_AVAILABLE:
+        /* ⚠ capsled1: an INCOMING connection no longer queries SDP (vendor patch in
+         * hid_host.c), so it never produces this event. Only an OUTGOING connection --
+         * hid_host_connect, after pairing -- still does. `descriptor available 0` beside a
+         * successful SET_PROTOCOL handshake is therefore the NEW normal, and is the sign
+         * this build's flow ran: the old one could only reach the handshake through a
+         * completed descriptor query. */
         gBhDescAvail++;
         break;
 

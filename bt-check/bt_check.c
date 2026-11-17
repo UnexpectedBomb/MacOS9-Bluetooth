@@ -373,7 +373,7 @@ static void RowHex(const char *label, unsigned long v, short digits)
  * now parses the authoritative tag out of src/bt_probe.c and fails the build if this
  * constant disagrees, so it cannot drift again. Same lesson as the driver's own
  * three-way version guard and the panel's status string. */
-#define kExpectedDriverTag 0x76493630UL   /* 'vI60' = driver v18.6 */
+#define kExpectedDriverTag 0x76493730UL   /* 'vI70' = driver v18.7 */
 
 /* ⚠⚠ A FIXED HISTORICAL BOUNDARY, DELIBERATELY NOT WRITTEN AS THE SAME LITERAL AS
  * kExpectedDriverTag ABOVE, AND NOT A SPELLING TRICK.
@@ -3955,6 +3955,22 @@ m2_section:
                 SummaryText("    and needs 'HID channel LIVE now' 1 -- if that is 0, the");
                 SummaryText("    keyboard had not connected when this was read. Type on");
                 SummaryText("    it, wait a few seconds, and run BTCheck again.");
+            } else if (c[kWBatResponses] == 0 &&
+                       (((c[kWBatPctRc] & 0x100UL) != 0 && (c[kWBatPctRc] & 0xFFUL) != 0) ||
+                        ((c[kWBatStRc]  & 0x100UL) != 0 && (c[kWBatStRc]  & 0xFFUL) != 0))) {
+                /* ★ v99.111: A REFUSAL IS NOT SILENCE. The branch below said "the request
+                 * went out" whenever no answer came -- and on 2026-11-17 it said so over
+                 * `Feature 71 send rc 0x010C`: BTstack had refused the request, so the
+                 * keyboard was never asked. 0x0C is COMMAND_DISALLOWED, which
+                 * hid_host_send_get_report returns when the connection is not ESTABLISHED;
+                 * driver 18.6 could leave a connection that way for its whole life (an SDP
+                 * lookup that never finished). 18.7 no longer makes that lookup. */
+                SummaryText("    ⚠⚠ REFUSED BEFORE IT WAS SENT. BTstack turned the request");
+                SummaryText("    down (a send rc above with a nonzero low byte), so the");
+                SummaryText("    keyboard was never asked: this is NOT the device's silence.");
+                SummaryText("    0x0C = COMMAND_DISALLOWED, the connection was not ready.");
+                SummaryText("    Driver 18.6 could leave a connection so for its whole life");
+                SummaryText("    (a lookup that never finished); 18.7 does not make it.");
             } else if (c[kWBatResponses] == 0) {
                 SummaryText("    ⚠⚠ ASKED AND NEVER ANSWERED. The request went out and no");
                 SummaryText("    GET_REPORT_RESPONSE came back at all -- not even a");

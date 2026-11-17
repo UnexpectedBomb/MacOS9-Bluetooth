@@ -964,11 +964,29 @@ static void hid_host_packet_handler(uint8_t packet_type, uint16_t channel, uint8
                                         log_info("Incoming interrupt connection opened: set boot mode");
                                         break;
                                     default:
-                                        // SDP query
-                                        log_info("Incoming interrupt connection opened: start SDP query");
-                                        connection->state = HID_HOST_W2_SEND_SDP_QUERY;
-                                        hid_host_handle_sdp_client_query_request.callback = &hid_host_handle_start_sdp_client_query;
-                                        (void) sdp_client_register_query_callback(&hid_host_handle_sdp_client_query_request);
+                                        /* claude-os9 PATCH (capsled1, 2026-11-17): no SDP query on an
+                                         * incoming connection. See vendor/btstack/CLAUDE-OS9-PATCHES.md.
+                                         *
+                                         * Upstream starts an SDP query here to fetch the HID descriptor and
+                                         * holds the connection in W2_SEND_SDP_QUERY / W4_SDP_QUERY_RESULT
+                                         * until it completes. sdp_client.c has no timeout, so a query that
+                                         * never completes leaves the connection below ESTABLISHED for its
+                                         * whole life: hid_host_send_report and hid_host_send_get_report then
+                                         * refuse with COMMAND_DISALLOWED (the A1016's Caps Lock LED and its
+                                         * battery query, measured 2026-11-17) and SET_PROTOCOL is never sent.
+                                         *
+                                         * Tiger, on the same Mac, module and keyboard, sends SET_PROTOCOL
+                                         * (REPORT) straight after both channels open and never queries SDP on
+                                         * a reconnect (docs/TIGER-HCI-TRACE.md). Nothing in the driver reads
+                                         * the descriptor. So this does what the SDP success path below does
+                                         * for an incoming connection, minus the query and the descriptor
+                                         * event: stay ESTABLISHED (set above) and ask for REPORT protocol now.
+                                         * Outgoing connections (hid_host_connect) still query SDP first: they
+                                         * need it for the PSMs. */
+                                        log_info("Incoming interrupt connection opened: set report mode, no SDP query");
+                                        connection->set_protocol = true;
+                                        connection->requested_protocol_mode = HID_PROTOCOL_MODE_REPORT;
+                                        l2cap_request_can_send_now_event(connection->control_cid);
                                         break;
                                 }
                                 break;

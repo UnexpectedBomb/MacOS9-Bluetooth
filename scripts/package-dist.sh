@@ -27,12 +27,16 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 # The five shipped pieces. Paths only: everything else comes from the MacBinary header.
 # Release 18.6 (2026-11-16): driver 18.6, switcher 1.7 (unchanged code), panel 19.8,
 # strip 2.7, BTCheck 99.110.
+# Release 18.7 (2026-11-17): driver 18.7 and BTCheck 99.111 are the only new files. The
+# switcher, panel and strip are UNCHANGED: the 18.7 GitHub release re-attaches their 18.6
+# assets byte for byte rather than re-encoding them, so only the first and last lines below
+# feed the 18.7 release.
 SRCS="
-$ROOT/build/USBBluetoothSupport-v18.6.bin
+$ROOT/build/USBBluetoothSupport-v18.7.bin
 $ROOT/build/USBBluetoothSwitch-v1.7.bin
 $ROOT/cpanel/build/Bluetooth-19.8.bin
 $ROOT/csm/build/BluetoothStrip-v2.7.bin
-$ROOT/bt-check/build/BTCheck_v99.110.bin
+$ROOT/bt-check/build/BTCheck_v99.111.bin
 "
 
 mkdir -p "$OUT"

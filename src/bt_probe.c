@@ -360,7 +360,7 @@ BTDriverDesc TheUSBDriverDescription[kBTDescRules] =
     { 10, 'O','S','9','B','T','P','r','o','b','e' },
     0x00,                                       /* driverClass matches device class 0 */
     0x00,
-    0x18, 0x60, finalStage, 0,                     /* 18.6                           */
+    0x18, 0x70, finalStage, 0,                     /* 18.7                           */
     kUSBDoNotMatchGenericDevice | kUSBDoNotMatchInterface
   },
 #endif /* kSendModeSwitch -- rule 1 */
@@ -431,7 +431,7 @@ BTDriverDesc TheUSBDriverDescription[kBTDescRules] =
     { 10, 'O','S','9','B','T','P','r','o','b','e' },
     kBTClass,                                   /* driverClass MATCHES device class */
     kBTSubClass,
-    0x18, 0x60, finalStage, 0,                     /* 18.6                           */
+    0x18, 0x70, finalStage, 0,                     /* 18.7                           */
     kUSBDoNotMatchInterface
   },
 
@@ -450,7 +450,7 @@ BTDriverDesc TheUSBDriverDescription[kBTDescRules] =
     { 10, 'O','S','9','B','T','P','r','o','b','e' },
     kBTClass,
     kBTSubClass,
-    0x18, 0x60, finalStage, 0,                     /* 18.6                           */
+    0x18, 0x70, finalStage, 0,                     /* 18.7                           */
     kUSBInterfaceMatchOnly
   },
 
@@ -495,7 +495,7 @@ BTDriverDesc TheUSBDriverDescription[kBTDescRules] =
     { 10, 'O','S','9','B','T','P','r','o','b','e' },
     0x00,                                       /* driverClass matches device class 0 */
     0x00,
-    0x18, 0x60, finalStage, 0,                     /* 18.6                           */
+    0x18, 0x70, finalStage, 0,                     /* 18.7                           */
     kUSBDoNotMatchGenericDevice | kUSBDoNotMatchInterface
   },
 
@@ -2171,7 +2171,7 @@ static void EnsureBlock(void)
 
         for (p = (unsigned long *)((lo + 3) & ~3UL); p < lim; p++) {
             if (p[kWMagic] == 0x42545031UL &&
-                p[kWBuild] == 0x76493630UL &&      /* 'vI60' -- THIS build only */
+                p[kWBuild] == 0x76493730UL &&      /* 'vI70' -- THIS build only */
                 p[kWEnd]   == 0x454E4453UL) {
                 gCB = p;                           /* adopt it; do NOT re-zero */
                 return;
@@ -2184,7 +2184,7 @@ static void EnsureBlock(void)
 
     for (i = 0; i < kWCount; i++) gCB[i] = 0;
     gCB[kWMagic] = 0x42545031UL;   /* 'BTP1' */
-    gCB[kWBuild] = 0x76493630UL;   /* 'vI60'. ⚠ MUST match the tag EnsureBlock scans
+    gCB[kWBuild] = 0x76493730UL;   /* 'vI70'. ⚠ MUST match the tag EnsureBlock scans
                                     * for above, or instances will never adopt each
                                     * other's block and the interlock silently fails.
                                     * BTCheck matches ONLY the leading 'v'

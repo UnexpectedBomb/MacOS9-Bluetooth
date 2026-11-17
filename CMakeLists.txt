@@ -103,7 +103,7 @@ endif()
 # alone. Bumping DRIVER_VER is now the whole job for the filename; the 'vers' resource
 # and the block build tag in src/bt_probe.c still need to move with it, and there is a
 # check below that fails the build if they disagree.
-set(DRIVER_VER "18.6")
+set(DRIVER_VER "18.7")
 
 add_custom_command(OUTPUT USBBluetoothSupport-v${DRIVER_VER}.ndrv
     COMMAND ${REZ} ${REZ_FLAGS} ${CMAKE_CURRENT_SOURCE_DIR}/bt_probe.r

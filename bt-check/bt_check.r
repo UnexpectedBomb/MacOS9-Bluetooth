@@ -33,7 +33,7 @@ resource 'SIZE' (-1) {
 
 resource 'vers' (1, "BTCheck") {
     0x99,
-    0x99,                   /* 99.110 -- BCD. ⚠ It had drifted to 26.0 while the target
+    0x99,                   /* 99.111 -- BCD. ⚠ It had drifted to 26.0 while the target
                              * name said v45, so Get Info disagreed with the filename,
                              * and this comment then itself drifted to naming 47.0
                              * while the field above read 0x61. bt_check.c has no copy
@@ -49,8 +49,8 @@ resource 'vers' (1, "BTCheck") {
     release,
     0x00,
     verUS,
-    "99.110",
-    "99.110"
+    "99.111",
+    "99.111"
 };
 
 /* ★ RELEASE 18.6 (user, 2026-11-16): PLAIN VERSIONS, as for every file of the stack.
@@ -66,6 +66,6 @@ resource 'vers' (2, "BTCheck") {
     release,
     0x00,
     verUS,
-    "99.110",
-    "OS 9 Bluetooth 18.6"
+    "99.111",
+    "OS 9 Bluetooth 18.7"
 };
