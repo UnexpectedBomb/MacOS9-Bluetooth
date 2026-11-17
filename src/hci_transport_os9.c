@@ -38,6 +38,10 @@
  * file does not drag USB.h into BTstack's include world. Signatures must match
  * src/hci.h exactly. */
 extern long BT_SendHCICommand(const void *pkt, unsigned long len);
+/* v17.8: the inquiry's page-scan-rep-mode + clock offset for an address (bt_btstack.c),
+ * so the Create_Connection patch below pages at the device's scan phase, not blind. */
+extern int  BT_PageParamsFor(const unsigned char *addr6le,
+                             unsigned char *psrm, unsigned short *clkoff);
 extern long BT_SendACL(const void *pkt, unsigned long len);
 extern int  BT_CanSendCommand(void);
 extern int  BT_CanSendACL(void);
@@ -84,6 +88,9 @@ unsigned long gEvtRing[kEvtRingLen], gEvtRingIdx, gEvtTotal;
 unsigned long gRrsfCount, gRrsfStatus, gRrsfHandle;
 unsigned long gAclCapCount;
 unsigned char gAclCap[kAclCapSlots][kAclCapBytes];
+/* aclread1: inbound ACL packets whose header length disagrees with the size delivered
+ * (BTstack drops these), and the last one as (size << 16) | ACL length. */
+unsigned long gAclRxBadLen, gAclRxBadLast;
 /* v9.1: the OUTBOUND half. See the capture site in transport_send_packet -- the
  * inbound capture existed from v8.7 and its mirror did not, which is why our own
  * Connection Response has never been looked at. gAclTxCapLen keeps the FULL length
@@ -116,6 +123,39 @@ unsigned long gNumCompEvts, gNumCompTotal, gNumCompHandle, gNumCompMs;
 /* The handler BTstack gives us in register_packet_handler. */
 static void (*gPacketHandler)(uint8_t packet_type, uint8_t *packet, uint16_t size);
 
+/* ★★★★ v18.2: THE SYNTHETIC-0x0B INJECTION, MADE CALLABLE ON DEMAND.
+ *
+ * Factored out of the inline Command-Status path in BT_DeliverPacket below (same event,
+ * same all-zero features -- the long note there is why zeros are the load-bearing choice
+ * and must not become a plausible-looking fabrication). The reason it is a function now:
+ * a dropped ACL re-inits the connection and hci_connection_init zeroes bonding_flags
+ * (hci.c:4469), wiping the BONDING_RECEIVED_REMOTE_FEATURES this event sets -- after which
+ * the incoming HID L2CAP channel is stuck in WAIT_REMOTE_SUPPORTED_FEATURES and never
+ * reaches CONNECTION_OPENED. The half-open RE-ASSERT in bt_btstack.c restores the flag by
+ * calling this directly, without waiting for BTstack to re-issue 0x041B.
+ *
+ * ⚠ The caller owns the handle and the decision to inject: the inline path passes
+ * gLastConnHandle on the 0x041B Command Status; the re-assert passes the live sampled
+ * handle ONLY when hci_remote_features_available() reads false, so this never re-asserts
+ * a flag that is already set (which on the dedicated-bonding path would re-raise
+ * BONDING_SEND_AUTHENTICATE_REQUEST and re-fire an auth request).
+ * ⚠ Counted in gSynthRrsf like every synthetic event, so a fabricated event always has an
+ * audit trail; the re-assert counts its own firings separately (bt_btstack.c). */
+void BT_InjectSyntheticFeatures(unsigned long handle)
+{
+    unsigned char ev[13];
+    int i;
+    if (handle == 0 || gPacketHandler == NULL) return;
+    ev[0] = 0x0B;                                   /* READ_REMOTE_SUPPORTED_FEATURES_COMPLETE */
+    ev[1] = 11;                                     /* status + handle + 8 features             */
+    ev[2] = 0;                                      /* status: success                          */
+    ev[3] = (unsigned char)(handle & 0xFF);
+    ev[4] = (unsigned char)((handle >> 8) & 0xFF);
+    for (i = 5; i < 13; i++) ev[i] = 0;             /* zeros: see the inline note below         */
+    gSynthRrsf++;
+    gPacketHandler(HCI_EVENT_PACKET, ev, 13);
+}
+
 /* ---- upward: controller to BTstack ------------------------------------- *
  * Called from the two USL completions in bt_probe.c. The packet is handed
  * straight up; BTstack copies what it needs to keep, which is why the buffer
@@ -125,9 +165,126 @@ static void (*gPacketHandler)(uint8_t packet_type, uint8_t *packet, uint16_t siz
  * queued gets serviced in the same interrupt rather than waiting for the next
  * completion to arrive. On a link that goes quiet immediately after a packet,
  * that difference is the difference between progress and a stall. */
+/* ★★★★★★ btwake1: WHAT THE MODULE HAD TO SAY WHEN THE MAC WOKE.
+ *
+ * With remote wakeup armed, the module wakes the Mac when it has something to deliver --
+ * a key press or a mouse movement, which is the point, but equally anything else it
+ * reports: a device dropping its link, a mode change, a stranger paging us. The Sleep
+ * Assistant can say only "WOKEN BY USB on fn0", and fn0 also hosts the wired keyboard and
+ * its mouse. So, per sleep, the FIRST packet the module delivers after the sleep demand,
+ * whose device it came from, and how many packets arrived before the Expert told us of the
+ * wake: one that arrives before that notification was waiting at the resume.
+ *
+ * Slot layout, 4 words (slot = (sleep - 1) % kWakeRecSlots):
+ *   [0] bit 31 seen | bit 30 arrived BEFORE the wake notification | kind << 24 (1 event,
+ *       2 ACL) | byte 2 << 16 (an event's first parameter, e.g. a status) | code (event)
+ *       or connection handle (ACL)
+ *   [1] 0x1000000 | the device's top 3 address bytes (0 = no device for this packet)
+ *   [2] its low 3 address bytes
+ *   [3] packets delivered before the wake notification (capped 0xFFFF) << 16 |
+ *       ms from the demand to the first packet (capped 0xFFFF; the timebase stops in sleep)
+ *
+ * ⚠ Interrupt level: plain stores and a read-only walk of BTstack's connection list. */
+unsigned long gWakeRec[kWakeRecSlots][4];
+unsigned long gWakeRecSleeps, gWakeRecWakes;
+static int           gWakeRecArmed;     /* waiting for this sleep's first packet          */
+static int           gWakeRecWoke;      /* the wake notification has come for this sleep  */
+static int           gWakeRecSlot;
+static unsigned long gWakeRecDemandMs, gWakeRecBefore;
+
+void BT_WakeRecDemand(void)
+{
+    int k;
+    gWakeRecSlot = (int)(gWakeRecSleeps % kWakeRecSlots);
+    gWakeRecSleeps++;
+    for (k = 0; k < 4; k++) gWakeRec[gWakeRecSlot][k] = 0;
+    gWakeRecBefore   = 0;
+    gWakeRecWoke     = 0;
+    gWakeRecDemandMs = (unsigned long)hal_time_ms();
+    gWakeRecArmed    = 1;
+}
+
+void BT_WakeRecWake(void)
+{
+    unsigned long b;
+    gWakeRecWakes++;
+    if (gWakeRecSleeps == 0 || gWakeRecWoke) return;
+    gWakeRecWoke = 1;
+    b = (gWakeRecBefore > 0xFFFFUL) ? 0xFFFFUL : gWakeRecBefore;
+    gWakeRec[gWakeRecSlot][3] = (gWakeRec[gWakeRecSlot][3] & 0xFFFFUL) | (b << 16);
+}
+
+/* An address as the event carries it (little-endian, 6 bytes) -> the 3+3 split. */
+static void WakeRecAddrLE(const unsigned char *a, unsigned long *hi, unsigned long *lo)
+{
+    *hi = 0x1000000UL | ((unsigned long)a[5] << 16) | ((unsigned long)a[4] << 8) | a[3];
+    *lo = ((unsigned long)a[2] << 16) | ((unsigned long)a[1] << 8) | a[0];
+}
+
+static void BT_WakeRecPacket(unsigned char type, const unsigned char *p, unsigned short size)
+{
+    unsigned long w0, hi = 0, lo = 0, ms;
+    unsigned int  handle = 0xFFFFU;
+    int s = gWakeRecSlot;
+
+    if (gWakeRecSleeps == 0) return;
+    if (!gWakeRecWoke) gWakeRecBefore++;
+    if (!gWakeRecArmed) return;
+    gWakeRecArmed = 0;
+
+    w0 = 0x80000000UL | (gWakeRecWoke ? 0UL : 0x40000000UL);
+    if (type == HCI_ACL_DATA_PACKET && size >= 2) {
+        handle = (unsigned int)((p[0] | (p[1] << 8)) & 0x0FFF);
+        w0 |= (2UL << 24) | handle;
+    } else if (type == HCI_EVENT_PACKET && size >= 2) {
+        unsigned char code = p[0];
+        w0 |= (1UL << 24) | ((unsigned long)(size >= 3 ? p[2] : 0) << 16) | code;
+        switch (code) {
+        case 0x04: case 0x16: case 0x17: case 0x18: case 0x20:   /* BD_ADDR at [2] */
+            if (size >= 8) WakeRecAddrLE(p + 2, &hi, &lo);
+            break;
+        case 0x07: case 0x12:                                     /* status, BD_ADDR at [3] */
+            if (size >= 9) WakeRecAddrLE(p + 3, &hi, &lo);
+            break;
+        case 0x03:                                                /* status, handle, BD_ADDR */
+            if (size >= 11) WakeRecAddrLE(p + 5, &hi, &lo);
+            break;
+        case 0x05: case 0x06: case 0x08: case 0x0B: case 0x0C:   /* status, handle at [3] */
+        case 0x13: case 0x14:                                     /* (0x13: count, handle)  */
+            if (size >= 5) handle = (unsigned int)((p[3] | (p[4] << 8)) & 0x0FFF);
+            break;
+        case 0x1B:                                                /* handle at [2] */
+            if (size >= 4) handle = (unsigned int)((p[2] | (p[3] << 8)) & 0x0FFF);
+            break;
+        default:
+            break;
+        }
+    }
+    if (hi == 0 && handle != 0xFFFFU) {
+        /* ⚠ Captured BEFORE BTstack sees the packet, so a Disconnection Complete's link
+         * is still in the list here. bd_addr_t is MSB first. */
+        hci_connection_t *c = hci_connection_for_handle((hci_con_handle_t)handle);
+        if (c != NULL) {
+            hi = 0x1000000UL | ((unsigned long)c->address[0] << 16)
+                             | ((unsigned long)c->address[1] << 8) | c->address[2];
+            lo = ((unsigned long)c->address[3] << 16)
+               | ((unsigned long)c->address[4] << 8) | c->address[5];
+        }
+    }
+    ms = (unsigned long)hal_time_ms() - gWakeRecDemandMs;
+    if (ms > 0xFFFFUL) ms = 0xFFFFUL;
+    gWakeRec[s][0] = w0;
+    gWakeRec[s][1] = hi;
+    gWakeRec[s][2] = lo;
+    gWakeRec[s][3] = (gWakeRec[s][3] & 0xFFFF0000UL) | ms;
+}
+
 void BT_DeliverPacket(unsigned char type, unsigned char *packet, unsigned short size)
 {
     if (gPacketHandler == NULL) return;
+
+    /* btwake1: before anything else -- see BT_WakeRecPacket. */
+    BT_WakeRecPacket(type, packet, size);
 
     if (type == HCI_EVENT_PACKET) {
         gRxEvent++;
@@ -161,6 +318,19 @@ void BT_DeliverPacket(unsigned char type, unsigned char *packet, unsigned short 
             if (n > kAclCapBytes) n = kAclCapBytes;
             for (i = 0; i < n; i++) gAclCap[gAclCapCount][i] = packet[i];
             gAclCapCount++;
+        }
+        /* ★ aclread1: THE PACKETS BTSTACK WILL DROP. hci.c acl_handler discards any ACL
+         * packet whose header length + 4 is not the delivered size, with only a
+         * log_error nobody sees. That is what a buffer shared by two reads produced:
+         * the A1015's Config Response start fragment, overwritten by its continuation
+         * and delivered at the start fragment's size. Counted here, where the size is
+         * known, so a lost packet is a number and not an inference. Expected 0. */
+        if (size >= 4) {
+            unsigned long alen = (unsigned long)packet[2] | ((unsigned long)packet[3] << 8);
+            if (alen + 4UL != (unsigned long)size) {
+                gAclRxBadLen++;
+                gAclRxBadLast = ((unsigned long)size << 16) | (alen & 0xFFFFUL);
+            }
         }
     }
 
@@ -280,16 +450,7 @@ void BT_DeliverPacket(unsigned char type, unsigned char *packet, unsigned short 
         && packet[2] == 0                                      /* accepted        */
         && packet[4] == 0x1B && packet[5] == 0x04               /* opcode 0x041B  */
         && gLastConnHandle != 0 && gPacketHandler != NULL) {
-        unsigned char ev[13];
-        int i;
-        ev[0] = 0x0B;                                   /* the event we never get  */
-        ev[1] = 11;                                     /* status+handle+8 features */
-        ev[2] = 0;                                      /* status: success          */
-        ev[3] = (unsigned char)(gLastConnHandle & 0xFF);
-        ev[4] = (unsigned char)((gLastConnHandle >> 8) & 0xFF);
-        for (i = 5; i < 13; i++) ev[i] = 0;             /* see the note above       */
-        gSynthRrsf++;
-        gPacketHandler(HCI_EVENT_PACKET, ev, 13);
+        BT_InjectSyntheticFeatures(gLastConnHandle);    /* v18.2: shared with the re-assert */
     }
 
     BT_Pump();
@@ -381,6 +542,24 @@ static int transport_send_packet(uint8_t packet_type, uint8_t *packet, int size)
     switch (packet_type) {
     case HCI_COMMAND_DATA_PACKET:
         if (!BT_CanSendCommand()) { gTxRefused++; return -1; }
+        /* ★ v17.8: feed the inquiry's clock offset + page-scan mode into a Create_Connection
+         * (opcode 0x0405) so an old CSR dongle pages the device at its scan phase instead of
+         * blind. BTstack hardcodes clock offset 0 (hci.c:7924), which runs out the 10.24 s
+         * pairing-window page timeout on the DBT-120's slow page scan -- the 0x04 PAGE TIMEOUT
+         * of runs 4-8. Command layout: opcode(2) len(1) BD_ADDR(6) PacketType(2) PSRM(1)
+         * Rsvd(1) ClockOffset(2) RoleSwitch(1), so PSRM is packet[11] and ClockOffset (LE) is
+         * packet[13..14]. Patched only when the inquiry saw this address; otherwise BTstack's
+         * values stand. ⚠ a1044pair1: the A1044 now pages a mouse from Pair as well, so this
+         * runs there too (it always did for the SDP query's connections). */
+        if (size >= 16 && packet[0] == 0x05 && packet[1] == 0x04 && packet[2] == 0x0D) {
+            unsigned char  psrm = 0;
+            unsigned short clk  = 0;
+            if (BT_PageParamsFor(&packet[3], &psrm, &clk)) {
+                packet[11] = psrm;
+                packet[13] = (unsigned char)( clk       & 0xFF);
+                packet[14] = (unsigned char)((clk >> 8) & 0xFF);
+            }
+        }
         gTxCmd++;
         err = BT_SendHCICommand(packet, (unsigned long)size);
         break;

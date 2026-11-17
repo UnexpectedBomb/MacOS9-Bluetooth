@@ -246,6 +246,14 @@ static OSStatus SwNotify     (UInt32 notification, void *pointer, UInt32 refCon)
 
 /* ---- Exported symbol #1: the one match rule ---------------------------------
  *
+ * ⚠⚠ (2026-11-16, release 18.6) THIS IS 1.7's ONE-RECORD DESCRIPTOR, RESTORED ON PURPOSE.
+ * 1.8 (commit 9b4d332) added a second record for a DBT-120 in HID-proxy mode (0A12:1000)
+ * and never ran on hardware, so the release ships the hardware-proven 1.7. 1.8 also
+ * showed that the "only the first record matches" belief below is WRONG: the Expert walks
+ * contiguous 64-byte 'usbd' records until the signature stops (bt_probe.c ships three).
+ * Re-apply 9b4d332 when a 0A12:1000 unit can be tested; until then read the next
+ * paragraph as history, not as a rule.
+ *
  * ⚠ ONE RECORD, DELIBERATELY. A second record here would be dead weight at best (see
  * the only-first-record note above) and a way to accidentally claim something at
  * worst. If this driver ever needs a second rule, it needs a second FILE.

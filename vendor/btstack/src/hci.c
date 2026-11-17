@@ -2153,14 +2153,22 @@ static void hci_initializing_run(void){
             hci_send_cmd(&hci_read_bd_addr);
             break;
         case HCI_INIT_READ_BUFFER_SIZE:
-            // only read buffer size if supported
-            if (hci_command_supported(SUPPORTED_HCI_COMMAND_READ_BUFFER_SIZE)){
-                hci_stack->substate = HCI_INIT_W4_READ_BUFFER_SIZE;
-                hci_send_cmd(&hci_read_buffer_size);
-                break;
-            }
-
-            /* fall through */
+            /* ★ claude-os9 PATCH (DBT-120, Bluetooth 1.1): send Read_Buffer_Size UNCONDITIONALLY.
+             * Upstream gated it on hci_command_supported(READ_BUFFER_SIZE), but that bitmap is
+             * filled ONLY by Read_Local_Supported_Commands (0x1002), a command that did not exist
+             * before BT 1.2. A 1.1 controller (our CSR DBT-120, HCI version 1) rejects 0x1002, so
+             * the bitmap is empty, the gate is false, Read_Buffer_Size is skipped,
+             * acl_packets_total_num stays 0, can_send_acl_classic is NEVER true, and no ACL data
+             * ever leaves the host -- pairing (HCI commands) works, but the HID L2CAP channel can
+             * never open. Read_Buffer_Size has been a MANDATORY core command since BT 1.1, and this
+             * is a Classic-only build (ENABLE_BLE undefined), so there is no LE-only controller to
+             * protect -- sending it unconditionally is correct here. (At this substate
+             * local_supported_features is still unread, so hci_classic_supported() would be true
+             * by default anyway; the gate buys nothing here but the 1.1 breakage.)
+             * See project_os9_bt_patha_continuous_and_btstack + vendor/btstack/CLAUDE-OS9-PATCHES.md. */
+            hci_stack->substate = HCI_INIT_W4_READ_BUFFER_SIZE;
+            hci_send_cmd(&hci_read_buffer_size);
+            break;
 
         case HCI_INIT_READ_LOCAL_SUPPORTED_FEATURES:
             hci_stack->substate = HCI_INIT_W4_READ_LOCAL_SUPPORTED_FEATURES;
@@ -3029,6 +3037,14 @@ static void handle_command_complete_event(uint8_t * packet, uint16_t size){
                 hci_stack->sco_data_packet_length = btstack_min(sco_len, HCI_ACL_PAYLOAD_SIZE);
 
                 hci_stack->acl_packets_total_num = (uint8_t) btstack_min(little_endian_read_16(packet,  9), MAX_NR_CONTROLLER_ACL_BUFFERS);
+                /* ★ claude-os9 PATCH (DBT-120): floor the ACL buffer count to >= 1. A counterfeit
+                 * CSR's self-reported limits are not trustworthy (ours claims a 679-byte ACL
+                 * payload; see btstack_config.h). A reported count of 0 would leave
+                 * can_send_acl_classic false forever; 1 is always safe because the card returns
+                 * Number_Of_Completed_Packets per send (Tiger-confirmed), so a serialized
+                 * send-one/wait-one path replenishes. A genuine non-zero count (e.g. the A1044's)
+                 * is left untouched. See vendor/btstack/CLAUDE-OS9-PATCHES.md. */
+                if (hci_stack->acl_packets_total_num == 0) hci_stack->acl_packets_total_num = 1;
                 hci_stack->sco_packets_total_num = (uint8_t) btstack_min(little_endian_read_16(packet, 11), MAX_NR_CONTROLLER_SCO_PACKETS);
 
                 log_info("hci_read_buffer_size: ACL size module %u -> used %u, count %u / SCO size %u, count %u",

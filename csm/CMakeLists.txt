@@ -18,7 +18,7 @@ set(CMAKE_C_STANDARD 99)
 set(CMAKE_C_STANDARD_REQUIRED TRUE)
 add_compile_options(-Wno-multichar -Wall)
 
-set(CSM_VER "2.5")
+set(CSM_VER "2.7")
 
 # ⚠⚠ A NATIVE 'cfrg' FRAGMENT, NOT AN 'sdev' RESOURCE. Both load and run, but the
 # 'sdev'-resource form is a second-class module the Control Strip will not let you drag
@@ -274,4 +274,12 @@ if(_vers_n LESS 2)
         "bt_csm.r must carry CSM_VER (\"${CSM_VER}\") in BOTH the short and long 'vers' "
         "strings; found ${_vers_n} occurrence(s). Bump both, or Get Info and the Finder "
         "disagree about which build this is.")
+endif()
+# ★ (release 18.6) The signature resource carries the version as well, and it sat at 2.6
+# through the idlefix1 build because nothing checked it. Now something does.
+string(FIND "${_csm_rez}" "\"${CSM_VER}, github.com/UnexpectedBomb\"" _sig_at)
+if(_sig_at EQUAL -1)
+    message(FATAL_ERROR
+        "bt_csm.r's 'BTcs' (0) signature string must read \"${CSM_VER}, "
+        "github.com/UnexpectedBomb\" -- it is a version stamp like the 'vers' strings.")
 endif()

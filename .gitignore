@@ -11,6 +11,13 @@ docs/source/
 
 # ⚠⚠ THE SCRUB LIST ITSELF. .scrub-identifiers holds the REAL device addresses that
 # sync-to-github.sh scans the public export FOR. A scanner must never publish the thing
-# it scans for, so the list is gitignored exactly as airport-extreme does it. It is
-# kept locally and in the Pi backup bundles; it is not in any repo.
+# it scans for, so the list is gitignored exactly as airport-extreme does it.
+#
+# ⚠ IT IS THEREFORE NOT IN THE BACKUP BUNDLES EITHER. An earlier version of this comment
+# claimed it was "kept locally and in the Pi backup bundles", which is wrong: a git bundle
+# carries committed objects, so a gitignored file is in none of them. It exists on this
+# disk and nowhere else. Losing it does not lose anything secret -- the addresses are
+# recoverable from the devices themselves and from logs/ -- but it DOES disable the
+# publication gate until it is rebuilt, and sync-to-github.sh refuses --push without it,
+# which is the safe direction for that failure to point.
 .scrub-identifiers

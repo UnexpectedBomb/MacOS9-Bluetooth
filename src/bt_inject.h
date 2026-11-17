@@ -96,8 +96,13 @@ void BT_MediaServiceAtTask(void);
  *
  * BT_InjectMouse is INTERRUPT-SAFE: deltas and buttons only, no allocation. It drops
  * the report and requests a task-level hop while no cursor device exists yet.
- * BT_MouseServiceAtTask creates that device and is TASK LEVEL ONLY.
- * BT_MouseFinalize disposes it, also task level.
+ * BT_MouseServiceAtTask creates that device and is TASK LEVEL ONLY; once it exists, a
+ * JADBProc hook (adbhook1) replaces it across the ADBReInit that every deep-sleep wake
+ * runs, which deletes every cursor device. adbhook2 adds the OHCI companion's fallback:
+ * BT_MouseSleepNote forgets the device at the Expert's sleep demand (and at its wake
+ * notice if the hook did not run), so the first report after the wake makes a new one
+ * at task level even when the hook never fires.
+ * BT_MouseFinalize takes the hook out and disposes the device, also task level.
  *
  * ⚠ `wheel` is COUNTED, NOT DELIVERED: the Cursor Device Manager has no wheel call and
  * the A1015 has no wheel. It is carried this far so a device that sends one appears in
@@ -105,6 +110,14 @@ void BT_MediaServiceAtTask(void);
 void BT_InjectMouse(short dx, short dy, unsigned char buttons, short wheel);
 void BT_MouseServiceAtTask(void);
 void BT_MouseFinalize(void);
+
+/* adbhook2, ANY LEVEL (no Toolbox): from ProbeNotify on kNotifySystemSleepDemand and on
+ * kNotifySystemSleepWakeUp. */
+enum { kBtMouseNoteDemand = 1, kBtMouseNoteWake = 2 };
+void BT_MouseSleepNote(int phase);
+/* adbhook2, ANY LEVEL: the wake hook's record (src/bt_adbdiag.h), stamped and its live
+ * words refreshed; returns its address for the counter block word kWAdbDiagPtr. */
+unsigned long BT_MouseDiagRefresh(void);
 
 extern unsigned long gMedPresses;     /* rising edges handed to us                  */
 extern unsigned long gMedRuns;        /* task-level services performed              */

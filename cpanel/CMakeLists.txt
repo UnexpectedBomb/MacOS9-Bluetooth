@@ -140,7 +140,7 @@ add_custom_command(TARGET Bluetooth_APPL POST_BUILD
 # ⚠ set(PANEL_VER) is maintained by scripts/bump-version.py alongside the 'vers'
 # resource, so it cannot drift -- a second hand-typed copy of a version is how the
 # BTCheck log filename ended up one revision behind for twenty builds.
-set(PANEL_VER "19.2")
+set(PANEL_VER "19.8")
 add_custom_command(TARGET Bluetooth_APPL POST_BUILD
     COMMAND ${CMAKE_COMMAND} -E copy
             ${CMAKE_CURRENT_BINARY_DIR}/Bluetooth.bin

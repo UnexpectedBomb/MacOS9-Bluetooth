@@ -158,6 +158,9 @@ extern unsigned long gRrsfCount, gRrsfStatus, gRrsfHandle;
 #define kAclCapBytes 16
 extern unsigned long gAclCapCount;
 extern unsigned char gAclCap[kAclCapSlots][kAclCapBytes];
+/* aclread1: inbound ACL whose header length + 4 != the delivered size -- the exact
+ * condition hci.c acl_handler drops on. Published as kWAclRxBadLen / kWAclRxBadLast. */
+extern unsigned long gAclRxBadLen, gAclRxBadLast;
 /* v9.1: the OUTBOUND capture, the mirror the inbound one never had. Every run since
  * v8.7 has examined what the peer says and none has examined what we answer.
  *
@@ -596,6 +599,9 @@ extern unsigned long gBatStRc,  gBatStHs,  gBatStLen,  gBatStVal;
 extern unsigned long gHidOutTried, gHidOutRc, gHidOutCid;
 /* v13.4: the fresh-bond latch. See the note at HCI_EVENT_LINK_KEY_NOTIFICATION. */
 extern unsigned long gJustBonded, gHidOutArmed;
+/* a1044pair2: connects skipped because THIS device's channel was already open, and
+ * connects made by the fallback timer. Packed into kWHidOutGate's upper bytes. */
+extern unsigned long gHidOutSkipped, gHidOutByTimer;
 /* v13.7: key-file opens that FAILED -- see the long note in bt_keyfile.c. */
 extern unsigned long gKfNoFile;
 
@@ -652,6 +658,9 @@ void BT_LinkCmdEnqueue(unsigned char what, unsigned long handle);
 void BT_LinkCmdReset(void);
 void BT_LinkCmdPump(void);
 extern unsigned long gLastConnHandle, gSynthRrsf;
+/* v18.2: restore a wiped BONDING_RECEIVED_REMOTE_FEATURES on demand (the half-open
+ * re-assert in bt_btstack.c). Defined in the transport beside the inline injection. */
+void BT_InjectSyntheticFeatures(unsigned long handle);
 /* v9.7: Number_Of_Completed_Packets, counted in the transport. Tiger gets one per
  * ACL send on this exact card; we appear to get none, and that is why the peer never
  * hears our Connection Response. See docs/TIGER-HCI-TRACE.md. */
@@ -672,6 +681,20 @@ extern unsigned long gMouseWheelSeen, gCurNewErr, gCurCreated;
 /* the scan filter: set at task level in ProbeInitialize, read at interrupt level */
 extern unsigned long gShowAllDevices, gInqFiltered;
 
+/* ★ btwake1: "Allow Bluetooth devices to wake this computer". The choice (set at task level
+ * from the Preferences marker in ProbeInitialize, or by the panel's kCmdSetWake) and what
+ * the module reported when it was applied -- bt_probe.c, see BT_WakePump. */
+extern unsigned long gWakeAllowed, gWakeSrc, gWakeApplyPending;
+extern unsigned long gWakeReqs, gWakeReqRc, gWakeStatus, gWakeAfterStatus;
+/* ★ btwake1: per sleep, the first packet the module delivered after the sleep demand, and
+ * how many it delivered before the wake notification -- hci_transport_os9.c, see
+ * BT_WakeRecPacket for the layout. Called from ProbeNotify: plain stores only. */
+#define kWakeRecSlots 8
+extern unsigned long gWakeRec[kWakeRecSlots][4];
+extern unsigned long gWakeRecSleeps, gWakeRecWakes;
+void BT_WakeRecDemand(void);
+void BT_WakeRecWake(void);
+
 /* the low-battery warning: policy in bt_keyfile.c, Notification Manager in bt_defer.c */
 extern unsigned long gBatWarnings, gAlertsPosted, gAlertsDropped, gAlertErr;
 extern unsigned long gNmFlushes, gNmFlushErr;   /* the device-names file */
@@ -680,6 +703,7 @@ extern unsigned long gHidDevOpens, gHidDevCloses, gHidDevFull;
 /* v16.1: the sweep's globals are gone with it. */
 /* v15.1: the A1015 report-ID reading, kept under measurement. */
 extern unsigned long gBatTargets, gBatGiveUps;
+extern unsigned long gBatOpenKicks, gBatSchedRuns, gBatLastElig, gBatArmNextNoop; /* v18.5 */
 extern short gMouseDxMin, gMouseDxMax, gMouseDyMin, gMouseDyMax;
 extern unsigned long gMouseBtnMask, gMouseRidOther;
 /* ⚠ SIX words per slot, 12 total. Renamed from BT_HidDevSnapshot(out8) in v15.3 so
@@ -728,7 +752,13 @@ extern unsigned long gInqAudio;
  *
  * ⚠ BT_AclLinkUp arms the reader immediately. It is called from the connection event,
  * which arrives on the INTERRUPT pipe -- never disarmed -- so the wake-up path cannot
- * be lost. Safe at interrupt level: both do counter arithmetic and one USBBulkRead. */
+ * be lost. Safe at interrupt level: both do counter arithmetic and one USBBulkRead.
+ *
+ * ⚠⚠ aclread1: "arms" means "arms a PARKED reader". The premise above (an idle read
+ * completes empty, so the reader parks) does not hold under Apple's USB stack on the
+ * FW800: the idle read just waits. Arming again there put a second read on the same PB
+ * and buffer at every link-up, and two reads into one buffer corrupted the A1015's
+ * L2CAP setup. ArmAclRead now keeps exactly one read in flight (gAclReadOut). */
 void BT_AclLinkUp(void);
 void BT_AclLinkDown(void);
 
@@ -803,6 +833,8 @@ extern unsigned long gPairAsked, gPairRc, gPairAddrHi, gPairAddrLo;
 #define kBadCmdRingLen 4
 extern unsigned long gFirstBadCmdStatus, gBadCmdCount;
 extern unsigned long gPairPath, gLinkWasUp;
+/* a1044pair1: Pair clicks that waited for a running scan to finish before paging. */
+extern unsigned long gPairDeferCount;
 extern unsigned long gArmed, gArmedHi, gArmedLo, gArmedFired, gArmedRc;
 extern unsigned long gSuppCmds[2], gSuppCmdsGot;
 extern unsigned long gLocalVer, gLocalMfr;

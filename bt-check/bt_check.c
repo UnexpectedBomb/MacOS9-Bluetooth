@@ -47,6 +47,7 @@
 #include <Components.h>   /* FindNextComponent -- M6 step 1 */
 #include <USB.h>
 #include <CursorDevices.h>   /* v99.95: read every mouse's resolution/acceleration */
+#include "../src/bt_adbdiag.h"  /* adbhook2: the wake hook's record -- ONE layout, the driver's */
 /* ⚠ NEW in v96, and it changes what this app links. The descriptor section reaches the
  * USB Expert's published properties through the Name Registry, because the descriptor
  * calls an application would rather use (USBGetConfigurationDescriptor and friends)
@@ -372,7 +373,7 @@ static void RowHex(const char *label, unsigned long v, short digits)
  * now parses the authoritative tag out of src/bt_probe.c and fails the build if this
  * constant disagrees, so it cannot drift again. Same lesson as the driver's own
  * three-way version guard and the panel's status string. */
-#define kExpectedDriverTag 0x76483630UL   /* 'vH60' = driver v17.6 */
+#define kExpectedDriverTag 0x76493630UL   /* 'vI60' = driver v18.6 */
 
 /* ⚠⚠ A FIXED HISTORICAL BOUNDARY, DELIBERATELY NOT WRITTEN AS THE SAME LITERAL AS
  * kExpectedDriverTag ABOVE, AND NOT A SPELLING TRICK.
@@ -689,7 +690,11 @@ enum {
     kWAlertErr = 736,
     /* v15.0: two HID devices at once */
     kWHidDevOpens = 737, kWHidDevCloses = 738, kWHidDevFull = 739,
-    kWSweepRuns = 740, kWSweepConnects = 741, kWSweepSkipped = 742, kWSweepRc = 743,
+    /* adbhook2: 740 was kWSweepRuns (retired v16.1, never printed) and now holds the
+     * address of the wake hook's record -- see the note at kWAdbDiagPtr in bt_probe.c. */
+    /* aclread1: 741..743 were the retired sweep words (never printed); now the ACL
+     * reader's in-flight guard and the inbound length witness -- see bt_probe.c. */
+    kWAdbDiagPtr = 740, kWAclArmSkipped = 741, kWAclRxBadLen = 742, kWAclRxBadLast = 743,
     kWDev0Cid = 744, kWDev0Hi = 745, kWDev0Lo = 746, kWDev0Role = 747,
     kWDev1Cid = 748, kWDev1Hi = 749, kWDev1Lo = 750, kWDev1Role = 751,
     kWMouseDxMin = 752, kWMouseDxMax = 753, kWMouseDyMin = 754, kWMouseDyMax = 755,
@@ -697,7 +702,7 @@ enum {
     kWCurMoveErr = 758, kWCurBtnErr = 759,
     kWSniffKbd = 766, kWSniffMse = 767, kWSniffOther = 768,
     kWMouseAbsDx = 770, kWMouseAbsDy = 771,
-    kWSweepEnabled = 772,
+    kWPairDeferred = 772,       /* a1044pair1: was kWSweepEnabled, retired and never printed */
     kWCurAccelErr = 773, kWCurButtonsErr = 774, kWCurUpiErr = 775,
     kWCurAccelUsed = 776, kWCurDevPtr = 777,
     kWMouseRatePeak = 769,
@@ -710,8 +715,15 @@ enum {
     kWIntDepth = 781,
     kWDelivMaxCmdUs = 782, kWDelivMaxUnsolUs = 783, kWDelivLastUs = 784,
     kWCompRing0 = 785, kWCompRingIdx = 793,
-    kWEnd = 794
+    kWBatOpenKicks = 794, kWBatSchedRuns = 795, kWBatLastElig = 796, kWBatArmNoop = 797, /* v18.5 */
+    /* btwake1: the wake option, what the module reported, and the per-sleep record.
+     * ⚠ kWEnd MOVED 798 -> 837 in the same commit as src/bt_probe.c and the panel. */
+    kWWakeOpt = 798, kWWakeReqs = 799, kWWakeReqRc = 800, kWWakeStatus = 801,
+    kWWakeAfterWake = 802, kWWakeSleeps = 803, kWWakeWakes = 804,
+    kWWakeRing0 = 805, kWWakeRingEnd = 836,
+    kWEnd = 837
 };
+#define kWakeRecSlots 8          /* ⚠ MUST match src/bt_pump.h: 8 sleeps x 4 words */
 #define kPagedSlots 4
 /* ⚠ MUST match src/bt_pump.h. 4 slots x 16 bytes, published 4 bytes per word. */
 #define kAclCapSlots 4
@@ -859,6 +871,393 @@ static const char *StageName(unsigned long s)
     case 7:  return "7 = bulk-OUT found, searching for bulk-IN";
     default: return "8 = all three pipes found, M0.1 complete";
     }
+}
+
+/* ================================================================================
+ *  adbhook2: THE WAKE HOOK'S RECORD, AND THE JADBProc CHAIN AS IT IS NOW.
+ * ================================================================================
+ *
+ * adbhook1 ran on the FW800 on 2026-11-16 and the A1015 still did not move after the
+ * wake: `cursor device created 1`, no row marked ours. Three causes fit those numbers
+ * (the hook never chained; something replaced JADBProc after us; our island is in the
+ * chain but ADBReInit never ran our code), and the hook's counters were never published.
+ * The driver now publishes them (src/bt_adbdiag.h) through block word kWAdbDiagPtr, and
+ * this walks the chain itself.
+ *
+ * ⚠ READ-ONLY, AND BOUNDED. The record is read only if its address lies inside the
+ * system heap and it carries its magic, its own address, its version and its end word.
+ * The chain is followed only through islands inside the system heap (every hook's island
+ * is a NewPtrSys block); the first address outside it is reported, not read: that is the
+ * ROM's own ADBProc, the end of the chain. */
+#define kLMJADBProcAt  0x06B8UL
+
+/* "N s ago", from Ticks; nothing when the event never happened. */
+static void AdAgo(Str255 l, unsigned long now, unsigned long t)
+{
+    if (t == 0) { PStrCat(l, "never"); return; }
+    PStrCat(l, "Ticks ");
+    PStrCatNum(l, (long)t);
+    if (now >= t) {
+        PStrCat(l, " (");
+        PStrCatNum(l, (long)((now - t) / 60UL));
+        PStrCat(l, " s of awake time before this check)");
+    }
+}
+
+/* Apple's own islands carry a 20-byte name after the 12-byte island ("USB  Mouse Shim",
+ * "USB  HIDCursorDriver"); 1 = a printable one was found. */
+static int AdIslandName(const unsigned char *p, Str255 out)
+{
+    short i, n = 0;
+    out[0] = 0;
+    for (i = 0; i < 20; i++) {
+        unsigned char ch = p[i];
+        if (ch == 0) break;
+        if (ch < 0x20 || ch > 0x7E) return 0;
+        n++;
+    }
+    while (n > 0 && p[n - 1] == ' ') n--;
+    if (n < 4) return 0;
+    BlockMoveData(p, &out[1], (Size)n);
+    out[0] = (unsigned char)n;
+    return 1;
+}
+
+static void AdbHookSection(unsigned long at)
+{
+    THz                  zone = SystemZone();
+    unsigned long        lo, hi, p, now, island;
+    const unsigned long *d;
+    Str255               l;
+    short                hop;
+    int                  inChain = 0;
+
+    SummaryText("");
+    SummaryText(" ⭐⭐⭐⭐⭐⭐ THE WAKE HOOK (adbhook2) - does the mouse survive a wake, and why");
+    if (zone == NULL) { SummaryText("    ⚠ SystemZone() returned NULL: not read"); return; }
+    lo = (unsigned long)zone;
+    hi = (unsigned long)zone->bkLim;
+    if (at == 0) {
+        SummaryText("    no record: block word 740 is 0. This driver predates adbhook2,");
+        SummaryText("    or its block has not been refreshed yet.");
+        return;
+    }
+    if ((at & 3UL) != 0 || at < lo || at + (unsigned long)kAdWords * 4UL > hi) {
+        l[0] = 0;
+        PStrCat(l, "    ⚠ record address 0x"); PStrCatHexN(l, at, 8);
+        PStrCat(l, " is outside the system heap: NOT read");
+        Summary(l);
+        return;
+    }
+    d = (const unsigned long *)at;
+    if (d[kAdMagic] != kAdMagicValue || d[kAdSelf] != at
+     || d[kAdVersionW] != kAdVersion || d[kAdEnd] != kAdEndValue) {
+        l[0] = 0;
+        PStrCat(l, "    ⚠ the record at 0x"); PStrCatHexN(l, at, 8);
+        PStrCat(l, " failed its checks (magic, self, version, end): NOT read");
+        Summary(l);
+        return;
+    }
+    now    = d[kAdTickNow];
+    island = d[kAdIsland];
+
+    SummaryText("  the hook:");
+    Row("    chained (1 = yes)",        d[kAdHooked]);
+    RowHex("    our island",            island, 8);
+    RowHex("    its routine descriptor", d[kAdRD], 8);
+    RowHex("    it chained to",         d[kAdOld], 8);
+    l[0] = 0;
+    PStrCat(l, "    JADBProc read back        0x"); PStrCatHexN(l, d[kAdInstallRead], 8);
+    if (island != 0)
+        PStrCat(l, d[kAdInstallRead] == island ? "  = our island: the write took"
+                                               : "  ⚠ NOT our island");
+    Summary(l);
+    l[0] = 0;
+    PStrCat(l, "    FlushCodeCacheRange said  ");
+    if (d[kAdFlushErr] == 0) PStrCat(l, "noErr");
+    else PStrCatNum(l, (long)(short)(d[kAdFlushErr] & 0xFFFFUL));
+    Summary(l);
+    l[0] = 0; PStrCat(l, "    installed at              "); AdAgo(l, now, d[kAdInstallTick]); Summary(l);
+    Row("    ADBReInit calls, before",  d[kAdPreN]);
+    Row("    ADBReInit calls, after",   d[kAdPostN]);
+
+    SummaryText("  the Expert's notifications:");
+    Row("    sleep demands",            d[kAdDemandN]);
+    l[0] = 0;
+    PStrCat(l, "    JADBProc at the last one  0x"); PStrCatHexN(l, d[kAdDemandJadb], 8);
+    if (d[kAdDemandN] != 0 && island != 0)
+        PStrCat(l, d[kAdDemandJadb] == island ? "  = our island, at the head"
+                                              : "  another hook at the head (see the chain)");
+    Summary(l);
+    Row("    wakes",                    d[kAdWakeN]);
+    l[0] = 0;
+    PStrCat(l, "    JADBProc at the last one  0x"); PStrCatHexN(l, d[kAdWakeJadb], 8);
+    if (d[kAdWakeN] != 0 && island != 0)
+        PStrCat(l, d[kAdWakeJadb] == island ? "  = our island, at the head"
+                                            : "  another hook at the head (see the chain)");
+    Summary(l);
+
+    SummaryText("  the cursor device:");
+    Row("    forgets, by the hook",     d[kAdForgetHook]);
+    Row("    forgets, at the demand",   d[kAdForgetDemand]);
+    Row("    forgets, at the wake",     d[kAdForgetWake]);
+    Row("    rebinds inside ADBReInit", d[kAdRebindHook]);
+    Row("    rebinds at task level",    d[kAdRebindTask]);
+    Row("      kept the old record",    d[kAdKept]);
+    Row("      made a new record",      d[kAdMade]);
+    Row("      failed (retried)",       d[kAdFail]);
+    {
+        unsigned long a = d[kAdAccelSaved];
+        l[0] = 0;
+        PStrCat(l, "    acceleration carried      ");
+        PStrCatNum(l, (long)(a >> 16));
+        PStrCat(l, ".");
+        PStrCatNum(l, (long)(((a & 0xFFFFUL) * 100UL) >> 16));
+        if (d[kAdAccelReset] != 0) {
+            PStrCat(l, "  (reset to inherit ");
+            PStrCatNum(l, (long)d[kAdAccelReset]);
+            PStrCat(l, "x)");
+        }
+        Summary(l);
+    }
+    RowHex("    our record now (0 = none)", d[kAdCurDev], 8);
+    l[0] = 0; PStrCat(l, "    last demand               "); AdAgo(l, now, d[kAdDemandTick]); Summary(l);
+    l[0] = 0; PStrCat(l, "    last hook call, before    "); AdAgo(l, now, d[kAdPreTick]);    Summary(l);
+    l[0] = 0; PStrCat(l, "    last hook call, after     "); AdAgo(l, now, d[kAdPostTick]);   Summary(l);
+    l[0] = 0; PStrCat(l, "    last wake                 "); AdAgo(l, now, d[kAdWakeTick]);   Summary(l);
+    l[0] = 0; PStrCat(l, "    last rebind               "); AdAgo(l, now, d[kAdRebindTick]); Summary(l);
+
+    /* The chain as it is now, from low memory. */
+    SummaryText("  THE JADBProc CHAIN NOW (low memory 0x06B8; the newest hook first):");
+    p = *(volatile unsigned long *)kLMJADBProcAt;
+    for (hop = 0; hop < 12; hop++) {
+        const unsigned short *w;
+        l[0] = 0;
+        PStrCat(l, "    ");
+        PStrCatNum(l, (long)hop);
+        PStrCat(l, ": 0x");
+        PStrCatHexN(l, p, 8);
+        if (p == 0) { PStrCat(l, "  (0: the chain ends here)"); Summary(l); break; }
+        if ((p & 1UL) != 0 || p < lo || p + 32UL > hi) {
+            PStrCat(l, "  outside the system heap: the end of the chain");
+            if (p >= 0xFF800000UL) PStrCat(l, " (the ROM: Apple's own ADBProc)");
+            Summary(l);
+            break;
+        }
+        w = (const unsigned short *)p;
+        if ((w[0] == 0x4EB9 || w[0] == 0x2048) && w[3] == 0x4EF9) {
+            Str255 name;
+            unsigned long jsr = ((unsigned long)w[1] << 16) | w[2];
+            unsigned long jmp = ((unsigned long)w[4] << 16) | w[5];
+            if (w[0] == 0x4EB9) { PStrCat(l, "  JSR 0x"); PStrCatHexN(l, jsr, 8); }
+            else                  PStrCat(l, "  (unhooked: 2048 2048 2048)");
+            PStrCat(l, "  JMP 0x");
+            PStrCatHexN(l, jmp, 8);
+            if (p == island) { PStrCat(l, "  <== OURS"); inChain = 1; }
+            else if (AdIslandName((const unsigned char *)p + 12, name)) {
+                PStrCat(l, "  \"");
+                PStrCatPStr(l, name);
+                PStrCat(l, "\"");
+            }
+            Summary(l);
+            p = jmp;
+        } else if (p == island && w[0] == 0x4EB9 && w[3] == 0x4E75) {
+            PStrCat(l, "  JSR, then RTS  <== OURS (we chained to 0)");
+            inChain = 1;
+            Summary(l);
+            break;
+        } else {
+            PStrCat(l, "  not an island (first word 0x");
+            PStrCatHexN(l, (unsigned long)w[0], 4);
+            PStrCat(l, "): the end of the chain");
+            Summary(l);
+            break;
+        }
+    }
+
+    /* What the numbers say. */
+    if (d[kAdHooked] == 0) {
+        SummaryText("    ⚠⚠ THE HOOK WAS NEVER CHAINED (no mouse report yet, or its");
+        SummaryText("    allocation failed). The demand/wake fallback still covers a wake.");
+    } else if (d[kAdWakeN] != 0 && d[kAdPreN] == 0) {
+        if (inChain) {
+            SummaryText("    ⚠⚠ OUR ISLAND IS IN THE CHAIN, BUT NO ADBReInit RAN OUR CODE");
+            SummaryText("    across these wakes. Apple's ADBProc at the end of the chain is");
+            SummaryText("    what deletes cursor devices, so the chain ran and skipped ours.");
+            SummaryText("    Leading candidate: the 68K emulator ran a stale translation of");
+            SummaryText("    our island's address (whatever 68K code was there before).");
+        } else {
+            SummaryText("    ⚠⚠ OUR ISLAND IS NOT IN THE CHAIN: something replaced JADBProc");
+            SummaryText("    after we chained, without chaining to us. The chain above names");
+            SummaryText("    what is there now; JADBProc at the demand and wake says when.");
+        }
+    } else if (d[kAdPreN] != 0) {
+        SummaryText("    ⭐ THE HOOK RAN: ADBReInit called our code (counts above).");
+    }
+    if (d[kAdWakeN] != 0) {
+        if (d[kAdMade] + d[kAdKept] >= d[kAdWakeN])
+            SummaryText("    ⭐ a cursor device was rebound at least once per wake.");
+        else if (d[kAdCurDev] == 0)
+            SummaryText("    ⓘ no record yet since the last wake: the first mouse report makes it.");
+        else
+            SummaryText("    ⚠ fewer rebinds than wakes, and a record is in use: read the rows.");
+    }
+}
+
+/* ★★★★★★ btwake1: "ALLOW BLUETOOTH DEVICES TO WAKE THIS COMPUTER" -- what the user chose,
+ * what the module then reported (GET_STATUS bit 1 = remote wakeup), and, per sleep, the
+ * first packet the module delivered after the sleep demand. See BT_WakeRecPacket in
+ * src/hci_transport_os9.c for the slot layout. */
+static void WakeStatusRow(const char *label, unsigned long w)
+{
+    Str255 line;
+    short  i;
+    line[0] = 0;
+    PStrCat(line, "    ");
+    PStrCat(line, label);
+    for (i = (short)strlen(label); i < 30; i++) PStrCatCh(line, ' ');
+    if (w == 0) PStrCat(line, "NOT RECEIVED");
+    else if ((w & 0xF0000UL) == 0x20000UL) {
+        PStrCat(line, "FAILED, error ");
+        PStrCatNum(line, (long)(short)(w & 0xFFFFUL));
+    } else {
+        PStrCatHexN(line, w & 0xFFFFUL, 4);
+        PStrCat(line, (w & 2UL) ? "  [remote wakeup ON]" : "  [remote wakeup off]");
+    }
+    Summary(line);
+}
+
+/* Which connected HID device an address is, from the driver's two slots. */
+static void WakeWho(Str255 line, unsigned long hi, unsigned long lo, const unsigned long *c)
+{
+    short k;
+    for (k = 0; k < 2; k++) {
+        unsigned long role = c[kWDev0Role + k * 4];
+        if (c[kWDev0Cid + k * 4] != 0
+            && c[kWDev0Hi + k * 4] == (hi & 0xFFFFFFUL) && c[kWDev0Lo + k * 4] == lo) {
+            PStrCat(line, (role & 1UL) ? " = the keyboard" :
+                          (role & 2UL) ? " = the mouse" : " = an HID device");
+            return;
+        }
+    }
+}
+
+static void BtWakeSection(const unsigned long *c)
+{
+    unsigned long opt = c[kWWakeOpt], st = c[kWWakeStatus], af = c[kWWakeAfterWake];
+    unsigned long sleeps = c[kWWakeSleeps], first, n, k;
+    Boolean allowed = (opt & 1UL) != 0, on = false, read = false;
+    Str255 line;
+
+    SummaryText("");
+    SummaryText(" ⭐⭐⭐⭐⭐⭐ BLUETOOTH WAKE (btwake1) - Allow Bluetooth devices to wake this computer");
+    if (opt == 0) {
+        SummaryText("    NOT PUBLISHED: the driver predates btwake1.");
+        return;
+    }
+    line[0] = 0;
+    PStrCat(line, "    the option                    ");
+    PStrCat(line, allowed ? "ALLOWED" : "not allowed");
+    k = (opt >> 4) & 0xFUL;
+    PStrCat(line, k == 2UL ? " (set from the panel this session)" :
+                  k == 1UL ? " (the Preferences marker, at startup)" : "");
+    Summary(line);
+    /* ⚠ Row pads the label to 26 characters: "    SET/CLEAR requests sent" was 27 and printed as
+     * "SET/CLEAR requests sent13" (UWAKE18). Keep these labels under 26. */
+    Row("    SET/CLEAR sent", c[kWWakeReqs]);
+    line[0] = 0;
+    PStrCat(line, "    the last one's status         ");
+    if (c[kWWakeReqRc] == 0) PStrCat(line, "NOT RECEIVED");
+    else {
+        if ((c[kWWakeReqRc] & 0xF0000UL) == 0x20000UL) PStrCat(line, "REFUSED at once, ");
+        PStrCatNum(line, (long)(short)(c[kWWakeReqRc] & 0xFFFFUL));
+        if ((c[kWWakeReqRc] & 0xFFFFUL) == 0) PStrCat(line, " = success");
+    }
+    Summary(line);
+    WakeStatusRow("the module's remote wakeup", st);
+    WakeStatusRow("  read after the last wake", af);
+    read = (st != 0 && (st & 0xF0000UL) == 0x10000UL);
+    on   = read && (st & 2UL) != 0;
+    if (!read)
+        SummaryText("    ⚠ THE MODULE'S STATE WAS NEVER READ: the request did not complete.");
+    else if (allowed && on) {
+        SummaryText("    ⭐ ARMED. A key press or movement on a connected device can now wake");
+        SummaryText("      the Mac -- if the host controller is armed too: on the FW800 that is");
+        SummaryText("      Sleep Assistant (uwake18A arms the Bluetooth controller's function).");
+    } else if (allowed)
+        SummaryText("    ⚠⚠ ALLOWED BUT THE MODULE READS OFF: it refused or dropped the arming.");
+    else if (on)
+        SummaryText("    ⚠⚠ NOT ALLOWED BUT THE MODULE READS ON: the CLEAR did not take.");
+    else
+        SummaryText("    Not allowed, and the module reads off: as chosen.");
+    if (allowed && af != 0 && (af & 0xF0000UL) == 0x10000UL && (af & 2UL) == 0)
+        SummaryText("    ⚠ The arming did NOT survive the last sleep (it was re-applied after).");
+
+    Row("    sleeps recorded", sleeps);
+    Row("    wakes recorded",  c[kWWakeWakes]);
+    if (sleeps == 0) return;
+    n = sleeps < (unsigned long)kWakeRecSlots ? sleeps : (unsigned long)kWakeRecSlots;
+    first = sleeps - n + 1;
+    SummaryText("    per sleep, the first packet the module delivered after the demand:");
+    for (k = first; k <= sleeps; k++) {
+        const unsigned long *s = &c[kWWakeRing0 + ((k - 1) % kWakeRecSlots) * 4];
+        unsigned long w0 = s[0], kind = (w0 >> 24) & 0xFUL;
+        line[0] = 0;
+        PStrCat(line, "      sleep ");
+        PStrCatNum(line, (long)k);
+        PStrCat(line, ": ");
+        if ((w0 & 0x80000000UL) == 0) {
+            PStrCat(line, "nothing delivered since its demand");
+            Summary(line);
+            continue;
+        }
+        if (kind == 2UL) {
+            PStrCat(line, "ACL data, handle 0x");
+            PStrCatHexN(line, w0 & 0xFFFFUL, 4);
+        } else {
+            PStrCat(line, "event 0x");
+            PStrCatHexN(line, w0 & 0xFFUL, 2);
+            PStrCat(line, " ");
+            PStrCat(line, EventName(w0 & 0xFFUL));
+            PStrCat(line, ", byte2 0x");
+            PStrCatHexN(line, (w0 >> 16) & 0xFFUL, 2);
+        }
+        Summary(line);
+        line[0] = 0;
+        PStrCat(line, "        ");
+        if (s[1] & 0x1000000UL) {
+            PStrCat(line, "from ");
+            PStrCatHexN(line, (s[1] >> 16) & 0xFF, 2); PStrCatCh(line, ':');
+            PStrCatHexN(line, (s[1] >>  8) & 0xFF, 2); PStrCatCh(line, ':');
+            PStrCatHexN(line,  s[1]        & 0xFF, 2); PStrCatCh(line, ':');
+            PStrCatHexN(line, (s[2] >> 16) & 0xFF, 2); PStrCatCh(line, ':');
+            PStrCatHexN(line, (s[2] >>  8) & 0xFF, 2); PStrCatCh(line, ':');
+            PStrCatHexN(line,  s[2]        & 0xFF, 2);
+            WakeWho(line, s[1], s[2], c);
+            PStrCat(line, "; ");
+        }
+        PStrCat(line, (w0 & 0x40000000UL) ? "BEFORE the wake notice" : "after the wake notice");
+        PStrCat(line, "; ");
+        PStrCatNum(line, (long)(s[3] >> 16));
+        PStrCat(line, " before it; +");
+        PStrCatNum(line, (long)(s[3] & 0xFFFFUL));
+        PStrCat(line, " ms");
+        Summary(line);
+    }
+    /* ⚠ UWAKE18 (2026-11-16) corrected this prose. It used to say a packet BEFORE the
+     * notice "woke the Mac", but its two control sleeps (option off, the A1016 pressed
+     * during the sleep, the wired keyboard waking the Mac) both showed the A1016 BEFORE
+     * the notice: an unarmed module HOLDS what arrives in a sleep and delivers it at the
+     * resume. The ring does not record the arming per sleep. */
+    SummaryText("    ⇒ BEFORE the wake notice = the packet was waiting when the Mac resumed.");
+    SummaryText("      It is the waker only if the module was armed for that sleep. Unarmed,");
+    SummaryText("      the module holds a key pressed during the sleep until something else");
+    SummaryText("      wakes the Mac (UWAKE18 A and G: the A1016 BEFORE the notice, no wake).");
+    SummaryText("      This ring does not record the arming per sleep: the rows above are");
+    SummaryText("      for now, and 'read after the last wake' covers the last sleep only.");
+    SummaryText("      An EVENT there in an armed sleep with nobody touching anything (a");
+    SummaryText("      link dropping, a mode change) = a wake nobody asked for.");
+    SummaryText("      'after the wake notice' with 0 before = something else woke the Mac.");
 }
 
 static void ScanSystemHeap(void)
@@ -1384,6 +1783,39 @@ static void ReportBlock(short b)
     Row("last ACL write status", c[kWAclOutStatus]);
     if (c[kWAclArmed] > 0 && c[kWAclInComp] == 0)
         SummaryText("      armed and quiet, which is correct until L2CAP exists");
+    /* ★ aclread1: how many reads share the one buffer, and whether a packet was lost to
+     * it. Reads armed minus completions is the number still posted; every banked log
+     * before aclread1 reads links up + 1 here, which is the defect. */
+    {
+        unsigned long armed = c[kWAclArmed], comp = c[kWAclInComp];
+        unsigned long out = (armed >= comp) ? armed - comp : 0;
+        /* ⚠ armed - completions also counts a REFUSED arm (it bumps kWAclArmed and never
+         * completes). Refusals follow empty completions (run 51's stack), so the warning
+         * below is gated on kWAclEmptyReads == 0, and on the guard never having engaged,
+         * which is what an old driver looks like on this stack. */
+        Row("ACL reads posted, not done", out);
+        Row("arms refused (one waiting)", c[kWAclArmSkipped]);
+        Row("inbound ACL, wrong length", c[kWAclRxBadLen]);
+        if (c[kWAclRxBadLen] > 0) {
+            Row("  last: delivered bytes", c[kWAclRxBadLast] >> 16);
+            Row("  last: header says",     c[kWAclRxBadLast] & 0xFFFFUL);
+        }
+        if (out > 1 && c[kWAclArmSkipped] == 0 && c[kWAclEmptyReads] == 0) {
+            SummaryText("    ⚠⚠ MORE THAN ONE READ IS POSTED ON THE ONE BUFFER. This is the");
+            SummaryText("      pre-aclread1 driver: every link-up added a read, and a packet");
+            SummaryText("      that lands before the previous one is handed up overwrites it.");
+        } else if (c[kWAclArmSkipped] > 0) {
+            SummaryText("    ⭐ ONE READ IN FLIGHT: the guard refused the extra arms that used");
+            SummaryText("      to stack a second read on the same buffer at each link-up.");
+        }
+        if (c[kWAclRxBadLen] > 0) {
+            SummaryText("    ⚠⚠ BTSTACK DROPPED THESE: its ACL handler discards a packet whose");
+            SummaryText("      header length + 4 is not the size handed up. A peer's answer");
+            SummaryText("      lost this way looks like a peer that never answered (0x69).");
+        } else if (c[kWAclInComp] > 0) {
+            SummaryText("    ⭐ every inbound ACL packet had the length its header says.");
+        }
+    }
 
     /* ⚠ RETIRED SECTION. These words are written ONLY by src/bt_hci_m1.c, which
      * is still compiled but deliberately never started since the M2 switchover --
@@ -3430,11 +3862,18 @@ m2_section:
     if ((c[kWBhOpenedStatus] & 0xFFUL) != 0 && c[kWBhOpenedStatus] != 0) {
         unsigned long st = c[kWBhOpenedStatus] & 0xFFUL;
         if      (st == 0x69UL) {
-            SummaryText("    0x69 = L2CAP RTX TIMEOUT: we sent an L2CAP connection");
-            SummaryText("    request and the PEER NEVER ANSWERED within L2CAP's own");
-            SummaryText("    10 s window (L2CAP_RTX_TIMEOUT_MS). The keyboard is");
-            SummaryText("    reachable at the ACL level -- check 'encryption enabled'");
-            SummaryText("    and 'Auth Completes' -- but is not answering HID setup.");
+            SummaryText("    0x69 = L2CAP RTX TIMEOUT: we sent an L2CAP signalling");
+            SummaryText("    request and NO ANSWER REACHED L2CAP within its own");
+            SummaryText("    10 s window (L2CAP_RTX_TIMEOUT_MS).");
+            /* ⚠ aclread1: "reached L2CAP", not "the peer sent". 2026-11-16's capture
+             * shows the A1015's Config Response arriving and being dropped by us. */
+            if (c[kWAclRxBadLen] > 0) {
+                SummaryText("    ⚠⚠ AND INBOUND PACKETS WERE DROPPED FOR LENGTH (M0.3), so");
+                SummaryText("    the answer may well have come and been lost on OUR side.");
+            } else {
+                SummaryText("    No inbound packet was dropped for length (M0.3), so the");
+                SummaryText("    peer is reachable at the ACL level and not answering.");
+            }
         }
         else if (st == 0x65UL) SummaryText("    0x65 = REFUSED, PSM not supported.");
         else if (st == 0x66UL) SummaryText("    0x66 = REFUSED, insufficient security.");
@@ -3549,6 +3988,17 @@ m2_section:
                 SummaryText("    ⚠ FEWER THAN TWO DEVICES WERE ASKED. Before v15.2 the");
                 SummaryText("    chain latched after the first, so the mouse was never");
                 SummaryText("    asked -- a different fact from the mouse saying no.");
+            }
+            /* ★ v18.5: WHY a late device can be missed (the intermittent keyboard gap). */
+            Row("    HID opens that kicked",  c[kWBatOpenKicks]);
+            Row("    scheduler passes",       c[kWBatSchedRuns]);
+            Row("    eligible last pass",     c[kWBatLastElig]);
+            Row("    kicks suppressed",       c[kWBatArmNoop]);
+            if (c[kWBatOpenKicks] > c[kWBatTargets]) {
+                SummaryText("    ⚠ A DEVICE OPENED BUT WAS NEVER ASKED (opens-that-kicked >");
+                SummaryText("    devices-asked). If 'eligible last pass' is 0 the scheduler ran");
+                SummaryText("    but never saw it eligible (slot cleared or batDone); if");
+                SummaryText("    'scheduler passes' is flat the kick never fired the pass.");
             }
             Row("    file flushes",          c[kWBatFlushes]);
             Row("    flush errors",          c[kWBatFlushErr]);
@@ -3753,8 +4203,11 @@ m2_section:
             if (c[kWHidDevOpens] != 0 && c[kWBhIncoming] >= c[kWHidDevOpens]) {
                 SummaryText("    ⭐ Every connection came from the device paging us.");
             } else if (c[kWHidDevOpens] != 0) {
-                SummaryText("    ⚠ Fewer incoming than connections -- something connected");
-                SummaryText("    without paging us, which this build has no way to do.");
+                /* ⚠ btwake1: this said "which this build has no way to do". Two ways
+                 * exist: the scan's SDP query pages what it found, and the driver opens
+                 * a freshly paired device's channel itself (13.5, a1044pair2). */
+                SummaryText("    ⓘ Fewer incoming than connections: the rest the Mac opened");
+                SummaryText("    -- the scan's own link, or a freshly paired device's channel.");
             }
             SummaryText("    ⚠ Page timeout is Tiger's 0x2000 (5.12 s), not BTstack's");
             SummaryText("    0x6000 (~15.4 s), for the pairing path that still pages.");
@@ -3905,6 +4358,11 @@ m2_section:
             SummaryText("    is a different fault from not decoding and from never running.");
             Row("    ⚠ 5-byte reports NOT id 02", c[kWMouseRidOther]);
 
+            /* adbhook2: the wake hook's own record, and the chain it should be on. */
+            AdbHookSection(c[kWAdbDiagPtr]);
+            /* btwake1: the wake option, the module's arming, and what woke each sleep. */
+            BtWakeSection(c);
+
             /* ★★★★★ v15.5: WHY THE CURSOR IS JERKY. Tiger drives this same mouse on
              * this same card smoothly -- measured 2026-09-25 -- so the hardware is
              * exonerated and the difference is ours. Tiger's captured trace sniffs at
@@ -4051,8 +4509,9 @@ m2_section:
             SummaryText("    ⭐⭐ A SETUP FAILURE, not a disconnect. hid_host finalizes");
             SummaryText("    the connection on this, so NO close event follows -- which");
             SummaryText("    is why 13.8's retry, armed off the close, never ran once.");
-            SummaryText("    Decoded above under 'open status'. 0x69 means the keyboard");
-            SummaryText("    did not answer L2CAP within its own 10 s RTX window.");
+            SummaryText("    Decoded above under 'open status'. 0x69 means no answer");
+            SummaryText("    reached L2CAP within its 10 s RTX window: read M0.3's");
+            SummaryText("    'inbound ACL, wrong length' before blaming the device.");
         }
         Row("    reconnects attempted",  c[kWBhReconnTried]);
         if (c[kWBhReconnTried] != 0) {
@@ -4084,7 +4543,8 @@ m2_section:
     } else if (c[kWBhOpened] == 0) {
         SummaryText("    ⚠ ACCEPTED AND NEVER OPENED, the same wall our own listener");
         SummaryText("    hit. Read the open status: it is L2CAP's, so 0x69 is an RTX");
-        SummaryText("    timeout and means the peer stopped answering again.");
+        SummaryText("    timeout: no answer reached L2CAP. If M0.3 counts inbound ACL");
+        SummaryText("    of the wrong length, the answer was lost on our side.");
         SummaryText("    ⇒ If the CANONICAL implementation fails here too, our L2CAP");
         SummaryText("    and security choices were never the cause -- which narrows");
         SummaryText("    this to the peer's LMP behaviour and is worth the run.");
@@ -4116,30 +4576,55 @@ m2_section:
      * never made, and the test of whether the power-cycle step after pairing was ever
      * the keyboard's requirement or just the shape of a missing call. */
     SummaryText("  ★★★★★★ DID WE ASK FOR THE HID CHANNEL OURSELVES? (v13.3)");
-    Row      ("        gate", c[kWHidOutGate]);
-    if (c[kWHidOutGate] == 0) {
+    /* ⚠ a1044pair2: 695 is PACKED -- low byte the gate, byte 1 the connects skipped
+     * because that device's own channel was already open, byte 2 the connects the 3 s
+     * fallback made. Read apart, or the gate prints as a large number. */
+    Row      ("        gate", c[kWHidOutGate] & 0xFFUL);
+    if ((c[kWHidOutGate] & 0xFFUL) == 0) {
         SummaryText("    OFF in this build, so the rows below are 0 by construction and");
         SummaryText("    say nothing. Every run before v13.3 was this build.");
     } else {
+        unsigned long hoSkip  = (c[kWHidOutGate] >>  8) & 0xFFUL;
+        unsigned long hoTimer = (c[kWHidOutGate] >> 16) & 0xFFUL;
         Row      ("        connects attempted",  c[kWHidOutTried]);
-        RowStatus("        its rc",              c[kWHidOutRc]);
+        RowStatus("        its rc (the last)",   c[kWHidOutRc]);
         RowHex   ("        hid_cid handed back", c[kWHidOutCid], 4);
         Row      ("        fresh bonds seen",   c[kWJustBonded]);
+        Row      ("        skipped, its own channel open", hoSkip);
+        Row      ("        made by the 3 s fallback", hoTimer);
+        SummaryText("      (a1044pair2: a Pair on a device whose link is already open");
+        SummaryText("       arms this too, so connects may exceed fresh bonds.)");
         if (c[kWHidOutTried] == 0 && c[kWJustBonded] == 0) {
             SummaryText("    NEVER ARMED: no new pairing happened this session, so there");
             SummaryText("    was nothing to connect to. Not a failure -- pair a device.");
+        } else if (c[kWJustBonded] > c[kWHidOutTried] + hoSkip) {
+            /* ⭐ a1044pair2: THE VERDICT THIS SECTION GAVE 2026-11-16 WAS WRONG. It printed
+             * "WE OPENED IT OURSELVES" for `fresh bonds 2, connects attempted 1`: the mouse
+             * had its channel and the keyboard never got one. Count before praising. */
+            if (c[kWHidOutTried] == 0) {
+                SummaryText("    ⚠⚠ ARMED AND NEVER FIRED. A bond was created and the connect");
+                SummaryText("      still did not run, so Authentication Complete did not");
+                SummaryText("      arrive with status 0 after it, or a channel was already");
+                SummaryText("      open. THIS is the row that caught v13.3 hanging the");
+                SummaryText("      trigger on an event that never fires.");
+            } else {
+                SummaryText("    ⚠⚠ A FRESH BOND GOT NO CONNECT: more devices bonded than");
+                SummaryText("      were connected or skipped.");
+            }
+            SummaryText("      Through a1044pair1 the guard was 'no channel open ANYWHERE',");
+            SummaryText("      so a device paired while another was connected never got");
+            SummaryText("      its channel (2026-11-16: the A1016 after the A1015). From");
+            SummaryText("      a1044pair2 the guard asks about the bonded device only, and");
+            SummaryText("      a 3 s fallback fires without Auth Complete, so on that build");
+            SummaryText("      this is a NEW fault: read the AUTHENTICATION COMPLETE ring");
+            SummaryText("      and the M3.7 rows.");
         } else if (c[kWHidOutTried] == 0) {
-            SummaryText("    ⚠⚠ ARMED AND NEVER FIRED. A bond was created and the connect");
-            SummaryText("      still did not run, so Authentication Complete did not");
-            SummaryText("      arrive with status 0 after it, or a channel was already");
-            SummaryText("      open. THIS is the row that caught v13.3 hanging the");
-            SummaryText("      trigger on an event that never fires.");
+            SummaryText("    EVERY FRESH BOND ALREADY HAD ITS CHANNEL: the device opened it");
+            SummaryText("      itself before we asked, so there was nothing to connect.");
         } else if ((c[kWHidOutRc] & 0xFFUL) == 0 && c[kWBhOpened] > 0) {
-            SummaryText("    ⭐⭐⭐⭐⭐ WE OPENED IT OURSELVES. Compare against whether the");
-            SummaryText("      user had to switch the device off and on: if they did NOT,");
-            SummaryText("      step 4 of the pairing instructions was never the keyboard's");
-            SummaryText("      requirement -- it was the shape of this call being missing.");
-            SummaryText("      Take it out of the panel and the help text.");
+            /* ⚠ btwake1: the "take it out of the panel" advice was 13.6's, long done. */
+            SummaryText("    ⭐⭐⭐⭐⭐ WE OPENED IT OURSELVES: no power cycle needed after");
+            SummaryText("      pairing (the step 13.6 deleted).");
         } else if ((c[kWHidOutRc] & 0xFFUL) == 0) {
             SummaryText("    ⚠ ACCEPTED BUT NO CHANNEL OPENED. hid_host_connect returned");
             SummaryText("      success and HID_SUBEVENT_CONNECTION_OPENED never arrived,");
@@ -4352,6 +4837,7 @@ m2_section:
         SummaryText("    is broken and the run says nothing about the peer.");
     } else {
         int ai, aw;
+        int capOpen = 0;     /* aclread1: the previous slot left a packet incomplete */
         for (ai = 0; ai < (int)c[kWAclCapCount] && ai < kAclCapSlots; ai++) {
             Str255 l; l[0] = 0;
             PStrCat(l, "      #");
@@ -4381,27 +4867,68 @@ m2_section:
              *     [0..1] handle+flags LE  [2..3] ACL len LE
              *     [4..5] L2CAP len LE     [6..7] CID LE      [8] signalling code */
             {
-#define ACLB(n) ((c[kWAclCap0 + ai * (kAclCapBytes / 4) + ((n) / 4)] \
-                  >> (24 - 8 * ((n) % 4))) & 0xFFUL)
+#define ACLBS(s, n) ((c[kWAclCap0 + (s) * (kAclCapBytes / 4) + ((n) / 4)] \
+                      >> (24 - 8 * ((n) % 4))) & 0xFFUL)
+#define ACLB(n) ACLBS(ai, n)
                 unsigned long hf   = ACLB(0) | (ACLB(1) << 8);
+                unsigned long alen = ACLB(2) | (ACLB(3) << 8);
+                unsigned long pbf  = (hf >> 12) & 0x3UL;
                 unsigned long cid  = ACLB(6) | (ACLB(7) << 8);
                 unsigned long code = ACLB(8);
                 Str255 d; d[0] = 0;
                 PStrCat(d, "         handle+flags 0x");
                 PStrCatHexN(d, hf, 4);
-                PStrCat(d, "  CID 0x");
-                PStrCatHexN(d, cid, 4);
-                if (cid == 1) {
-                    PStrCat(d, "  SIGNALLING code 0x");
-                    PStrCatHexN(d, code, 2);
-                    if (code == 0x01) PStrCat(d, " COMMAND REJECT");
-                    else if (code == 0x02) PStrCat(d, " Conn Request");
-                    else if (code == 0x03) PStrCat(d, " Conn Response");
-                    else if (code == 0x04) PStrCat(d, " Config Request");
-                    else if (code == 0x05) PStrCat(d, " Config Response");
+                /* ★ aclread1: PB = 01 is a CONTINUATION. Its bytes after the ACL header
+                 * are the rest of the previous packet's payload, not an L2CAP header, so
+                 * decoding a CID and a code out of them is wrong -- which is how
+                 * 2026-11-16's log came to print "Config Response" over one byte. */
+                if (pbf == 1) {
+                    PStrCat(d, "  CONTINUATION, ");
+                    PStrCatNum(d, (long)alen);
+                    PStrCat(d, " byte(s) of the packet before it");
+                } else {
+                    PStrCat(d, "  CID 0x");
+                    PStrCatHexN(d, cid, 4);
+                    if (cid == 1) {
+                        PStrCat(d, "  SIGNALLING code 0x");
+                        PStrCatHexN(d, code, 2);
+                        if (code == 0x01) PStrCat(d, " COMMAND REJECT");
+                        else if (code == 0x02) PStrCat(d, " Conn Request");
+                        else if (code == 0x03) PStrCat(d, " Conn Response");
+                        else if (code == 0x04) PStrCat(d, " Config Request");
+                        else if (code == 0x05) PStrCat(d, " Config Response");
+                    }
                 }
                 Summary(d);
+                /* ★ aclread1: a slot is written once, and only min(size, 16) bytes of it,
+                 * so everything past the packet's own end is zero UNLESS the packet was
+                 * handed up at a larger size than its header says. Non-zero there is an
+                 * earlier packet's bytes in a buffer two reads shared -- and a packet
+                 * BTstack's ACL handler then dropped. Readable on any driver's capture. */
+                if (alen + 4 < (unsigned long)kAclCapBytes) {
+                    int bi, dirty = 0;
+                    for (bi = (int)alen + 4; bi < kAclCapBytes; bi++)
+                        if (ACLB(bi) != 0) dirty = 1;
+                    if (dirty) {
+                        SummaryText("         ⚠⚠ BYTES PAST THIS PACKET'S END: it was handed up longer");
+                        SummaryText("         than its header says, over an earlier packet still in");
+                        SummaryText("         the buffer. BTstack drops a packet like this.");
+                    }
+                }
+                /* and a continuation needs an open packet before it: a start fragment
+                 * whose L2CAP length runs past its own ACL length, or a continuation of
+                 * one (kept open conservatively, since the sum is not tracked here). */
+                if (pbf == 1) {
+                    if (!capOpen) {
+                        SummaryText("         ⚠⚠ NO START FRAGMENT BEFORE THIS ONE: the packet it");
+                        SummaryText("         continues was lost before BTstack saw it.");
+                    }
+                } else {
+                    unsigned long l2 = ACLB(4) | (ACLB(5) << 8);
+                    capOpen = (l2 + 4 > alen) ? 1 : 0;
+                }
 #undef ACLB
+#undef ACLBS
             }
         }
         SummaryText("    ⚠ The CID is the whole point: 0x0001 is signalling, anything");
@@ -4766,15 +5293,33 @@ m2_section:
         /* ⚠ WHICH PATH RAN. v7.5 proved Create_Connection is rejected 0x12 for an
          * address we already hold a link to, so v7.6 authenticates the existing link
          * instead. Without this row the two paths' failures would look identical. */
+        /* ⚠ a1044pair2: this word now describes THIS address's link, read from BTstack's
+         * own list: 0 none, 1 open, 2 being made, 3 going away. Before it, it said only
+         * whether ANY link existed, which with two devices linked was no answer at all. */
         Row("link open at decision", c[kWLinkWasUp] & 0xFF);
+        if ((c[kWLinkWasUp] & 0xFF) == 2)
+            SummaryText("      (2 = its link was still being made, a1044pair2)");
+        else if ((c[kWLinkWasUp] & 0xFF) == 3)
+            SummaryText("      (3 = its link was going away; treated as none)");
         if (c[kWPairPath] == 1) {
             SummaryText("    PATH: authenticated the EXISTING link (0x0411)");
         } else if (c[kWPairPath] == 2) {
             SummaryText("    PATH: no link held, so Create_Connection (0x0405)");
-            SummaryText("    ⚠ RETIRED IN v8.3. Every Create_Connection this card was");
-            SummaryText("      ever sent was refused (0x12, then 0x0C), and the refusal");
-            SummaryText("      then made it refuse Inquiry too. A driver still taking");
-            SummaryText("      this path is older than v8.3.");
+            SummaryText("      (a1044pair1: every pre-2.1 controller pages a MOUSE, the");
+            SummaryText("      A1044 included. Read the rejection ring below: a 0x0405");
+            SummaryText("      refusal names the module's answer; none = it accepted.)");
+        } else if (c[kWPairPath] == 5) {
+            SummaryText("    PATH: ITS LINK WAS ALREADY BEING MADE, so nothing was sent.");
+            SummaryText("      Usually the scan's own SDP query paging it. The arm sends");
+            SummaryText("      Authentication_Requested when that link comes up: read");
+            SummaryText("      'arm fired on inbound' below. (a1044pair2: on 2026-11-16");
+            SummaryText("      the Pair paged it a SECOND time instead, and the A1044");
+            SummaryText("      refused that duplicate with 0x0C.)");
+        } else if (c[kWPairPath] == 4) {
+            SummaryText("    PATH: WAITING FOR THE SCAN TO FINISH, then it pages.");
+            SummaryText("      Pair was clicked while Scan For Devices was still running,");
+            SummaryText("      so the page waits up to 10 s rather than overlap it. If it");
+            SummaryText("      still reads 4 well after the scan, the page never fired.");
         } else if (c[kWPairPath] == 3) {
             SummaryText("    ⭐ PATH: ARMED AND WAITING -- nothing was sent.");
             SummaryText("      No link was held, so the driver did NOT try to page the");
@@ -4787,6 +5332,7 @@ m2_section:
             SummaryText("    PATH: not recorded -- driver older than v7.6");
         }
         RowStatus("  send / bonding rc", c[kWPairRc]);
+        Row("  waited for a scan (a1044pair1)", c[kWPairDeferred]);
         /* ⚠ HEX, because the explanatory text below talks in hex and this row used to
          * print DECIMAL -- so a status of 0x12 appeared as "18" directly above a list
          * naming 0x06, 0x05 and 0x04. That invites exactly the misreading a status row
@@ -4867,6 +5413,13 @@ m2_section:
                     else if (op == 0x0411) PStrCat(line, "Authentication_Requested");
                     else if (op == 0x0C52) PStrCat(line, "Write_Ext_Inquiry_Resp (benign)");
                     Summary(line);
+                    /* ⭐ a1044pair2: the one 0x0C read to the end so far. */
+                    if (op == 0x0405 && (e & 0xFF) == 0x0C) {
+                        SummaryText("        ^ 0x0C on 2026-11-16 was OUR second page to a");
+                        SummaryText("          device the scan's SDP query was already paging");
+                        SummaryText("          (Pair after the scan, a1044pair1). a1044pair2");
+                        SummaryText("          does not send that one: read PATH above.");
+                    }
                 }
             }
             RowHex("    first opcode",  (c[kWFirstBadCmd] >> 16) & 0xFFFF, 4);
@@ -4894,11 +5447,19 @@ m2_section:
          * never at the instant the user clicks Pair. */
         Row("arm fired on inbound",      c[kWArmedFired]);
         RowStatus("  Authentication_Requested rc", c[kWArmedRc]);
-        if (c[kWArmedFired] == 0)
+        /* ⚠ btwake1: path 1 authenticates at once and clears the arm, and only path 2
+         * calls gap_dedicated_bonding -- so neither "0 = never connected" nor "NO VERDICT
+         * YET" means anything there. Printed as before on the other paths. */
+        if (c[kWArmedFired] == 0 && c[kWPairPath] != 1)
             SummaryText("      0 = the device never connected after Pair was clicked.");
+        else if (c[kWArmedFired] == 0)
+            SummaryText("      (path 1 authenticates at once and clears the arm)");
         Row("bonding completions",       c[kWBondDone]);
         RowHex("  its status (HEX)",     c[kWBondStatus] & 0xFF, 2);
-        if (c[kWBondDone] == 0) {
+        if (c[kWBondDone] == 0 && c[kWPairPath] != 2) {
+            SummaryText("    (no dedicated bonding on this path: read the M2c PIN rows and");
+            SummaryText("     the AUTHENTICATION COMPLETE ring for the verdict)");
+        } else if (c[kWBondDone] == 0) {
             SummaryText("    ⚠ NO VERDICT YET. gap_dedicated_bonding was accepted but");
             SummaryText("      GAP_EVENT_DEDICATED_BONDING_COMPLETED never arrived, so");
             SummaryText("      the attempt is still open or died silently. Read the");
@@ -6746,7 +7307,10 @@ int main(void)
 
     LogOpen();
     { Str255 banner;
-      BTCheckName(banner, "BTCheck v", " - reading the Bluetooth probe driver's block");
+      /* ⚠ The parenthesis names the build: a test build's tag ("btwake1 reader"), or
+       * the release it shipped in. Runbooks validate a run against this first line. */
+      BTCheckName(banner, "BTCheck v",
+                  " (release 18.6) - reading the Bluetooth probe driver's block");
       Summary(banner); }
     SummaryText("Read-only: a System heap scan and this log file. No hardware touched.");
     SummaryText("");

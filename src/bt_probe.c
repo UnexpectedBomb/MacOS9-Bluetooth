@@ -360,7 +360,7 @@ BTDriverDesc TheUSBDriverDescription[kBTDescRules] =
     { 10, 'O','S','9','B','T','P','r','o','b','e' },
     0x00,                                       /* driverClass matches device class 0 */
     0x00,
-    0x17, 0x60, finalStage, 0,                     /* 17.6                           */
+    0x18, 0x60, finalStage, 0,                     /* 18.6                           */
     kUSBDoNotMatchGenericDevice | kUSBDoNotMatchInterface
   },
 #endif /* kSendModeSwitch -- rule 1 */
@@ -431,7 +431,7 @@ BTDriverDesc TheUSBDriverDescription[kBTDescRules] =
     { 10, 'O','S','9','B','T','P','r','o','b','e' },
     kBTClass,                                   /* driverClass MATCHES device class */
     kBTSubClass,
-    0x17, 0x60, finalStage, 0,                     /* 17.6                           */
+    0x18, 0x60, finalStage, 0,                     /* 18.6                           */
     kUSBDoNotMatchInterface
   },
 
@@ -450,7 +450,7 @@ BTDriverDesc TheUSBDriverDescription[kBTDescRules] =
     { 10, 'O','S','9','B','T','P','r','o','b','e' },
     kBTClass,
     kBTSubClass,
-    0x17, 0x60, finalStage, 0,                     /* 17.6                           */
+    0x18, 0x60, finalStage, 0,                     /* 18.6                           */
     kUSBInterfaceMatchOnly
   },
 
@@ -495,7 +495,7 @@ BTDriverDesc TheUSBDriverDescription[kBTDescRules] =
     { 10, 'O','S','9','B','T','P','r','o','b','e' },
     0x00,                                       /* driverClass matches device class 0 */
     0x00,
-    0x17, 0x60, finalStage, 0,                     /* 17.6                           */
+    0x18, 0x60, finalStage, 0,                     /* 18.6                           */
     kUSBDoNotMatchGenericDevice | kUSBDoNotMatchInterface
   },
 
@@ -1295,8 +1295,12 @@ enum {
     kWBadCmdRing    = 426,
     kWBadCmdRingEnd = 429,
     /* v7.6: which pairing path ran, and the link state that chose it. */
-    kWPairPath      = 430,           /* 1 = authenticate existing, 2 = create      */
-    kWLinkWasUp     = 431,           /* 0x100 | (a link was open at decision time) */
+    kWPairPath      = 430,           /* 1 = authenticate existing, 2 = create, 3 = arm
+                                      * and wait, 4 = wait for the scan, 5 = its link
+                                      * was being made (a1044pair2)                 */
+    kWLinkWasUp     = 431,           /* 0x100 | THIS address's link at decision time:
+                                      * 0 none, 1 open, 2 being made, 3 going away
+                                      * (a1044pair2; before it, any link at all)    */
     /* v7.8: arm-and-wait pairing, and the controller's own command bitmap. */
     kWArmedFired    = 432,           /* the arm fired on an inbound connection      */
     kWArmedRc       = 433,           /* 0x100 | Authentication_Requested's send rc  */
@@ -1667,7 +1671,13 @@ enum {
      * the suspected cause of TWO things this project has been treating as properties of
      * the hardware: the power-cycle step after pairing, and the Connect button being
      * unable to connect. See BT_TryOutgoingHid. These three words are how we find out. */
-    kWHidOutGate        = 695,       /* the compile-time gate, so a log names its build */
+    /* ⚠ a1044pair2: 695 is PACKED now. Low byte = the compile-time gate (unchanged, so an
+     * old reader's "gate == 0" test still means what it meant); byte 1 = fresh-bond
+     * connects SKIPPED because that device's own channel was already open; byte 2 =
+     * connects made by the fallback timer rather than at Authentication Complete. Both
+     * saturate at 255. Packed so the block does not grow: kWEnd stays 798 and an
+     * installed panel keeps finding the block. Only BTCheck reads 695. */
+    kWHidOutGate        = 695,       /* gate | skipped << 8 | by-timer << 16 (a1044pair2) */
     kWHidOutTried       = 696,       /* hid_host_connect calls made                   */
     kWHidOutRc          = 697,       /* 0x100 | its return code                       */
     kWHidOutCid         = 698,       /* the hid_cid it handed back                    */
@@ -1733,7 +1743,8 @@ enum {
     kWMouseBtnChanges   = 723,       /* CursorDeviceButtons calls (mask CHANGED)       */
     kWMouseDropped      = 724,       /* reports dropped: no cursor device yet          */
     kWMouseWheelSeen    = 725,       /* wheel bytes seen -- counted, never delivered   */
-    kWCurCreated        = 726,       /* CursorDeviceNewDevice successes (expect 0 or 1)*/
+    kWCurCreated        = 726,       /* CursorDeviceNewDevice successes: 0 or 1, then
+                                      * adbhook1: +1 per deep-sleep wake (the rebind) */
     kWCurNewErr         = 727,       /* CursorDeviceNewDevice failures                 */
     kWUnclaimedReports  = 728,       /* ⚠ reports NEITHER decoder accepted             */
     kWUnclaimedLen      = 729,       /* ⚠ length of the last such report               */
@@ -1763,10 +1774,19 @@ enum {
      * table FOUR binaries agree on, and a hand-edited count beside a hand-edited end is
      * exactly what scribbled 52 bytes past a System heap block in 14.6. A hole is free;
      * renumbering is not. */
-    kWSweepRuns         = 740,       /* retired v16.1 */
-    kWSweepConnects     = 741,       /* retired v16.1 */
-    kWSweepSkipped      = 742,       /* retired v16.1 */
-    kWSweepRc           = 743,       /* retired v16.1 */
+    /* ★ adbhook2: 740 is REUSED, and this is the one hole where that is safe now. It
+     * holds the ADDRESS of the wake hook's record (src/bt_adbdiag.h), which BTCheck
+     * checks (system heap, magic, self, end) before reading. The warning above was about
+     * a reader still printing the sweep's label over a new meaning: checked 2026-11-16,
+     * BTCheck 99.109 declares kWSweepRuns but prints none of the sweep words, and the
+     * panel and switcher never read 740. Using it keeps kWEnd at 798, so the installed
+     * panel (it finds the block by 'ENDS' at kWEnd) keeps working with this driver. */
+    kWAdbDiagPtr        = 740,       /* adbhook2: &gAdbDiag (was kWSweepRuns, retired) */
+    /* ★ aclread1: 741..743 REUSED under the same check as 740 (2026-11-16): no reader
+     * prints the sweep words, the panel reads nothing here, the CSM reads files. */
+    kWAclArmSkipped     = 741,       /* arms refused: a read was already in flight      */
+    kWAclRxBadLen       = 742,       /* inbound ACL with ACL length + 4 != delivered size */
+    kWAclRxBadLast      = 743,       /* the last one: (delivered size << 16) | ACL length */
     kWDev0Cid           = 744,       /* slot 0: cid, then addr hi/lo, then role bits   */
     kWDev0Hi            = 745,
     kWDev0Lo            = 746,
@@ -1807,7 +1827,9 @@ enum {
     kWMouseAbsDx        = 770,
     kWMouseAbsDy        = 771,
 
-    kWSweepEnabled      = 772,       /* retired v16.1 */
+    /* ★ a1044pair1: 772 REUSED (it was kWSweepEnabled, retired v16.1; checked 2026-11-16:
+     * no reader prints it, the panel never reads it). */
+    kWPairDeferred      = 772,       /* Pair clicks that waited for a scan to finish */
 
     /* v16.2: the Cursor Device setup calls' verdicts. Appended, NOT dropped into the
      * retired sweep holes at 740..743 -- filling a hole is safe only if every reader is
@@ -1903,7 +1925,28 @@ enum {
     kWCompRing0         = 785,       /* 8 slots, oldest-first by index below        */
     kWCompRingIdx       = 793,       /* next slot to write; ring is 785..792        */
 
-    kWEnd = 794,                     /* 'ENDS' */
+    /* v18.5: battery scheduler instrument -- pin the intermittent late-device miss */
+    kWBatOpenKicks      = 794,
+    kWBatSchedRuns      = 795,
+    kWBatLastElig       = 796,
+    kWBatArmNoop        = 797,
+
+    /* ★★★★★★ btwake1: "ALLOW BLUETOOTH DEVICES TO WAKE THIS COMPUTER" (Tiger's option).
+     * The module is remote-wakeup capable (bmAttributes E0) and nothing arms it in HCI mode;
+     * these say what we asked for, what the module then reported, and -- per sleep -- what it
+     * delivered first, so a wake (or a wake nobody asked for) can be attributed to a device.
+     * ⚠ APPENDED, kWEnd moves 798 -> 837: the panel and BTCheck move with it in this build. */
+    kWWakeOpt           = 798,       /* 0x100 | allowed | source << 4 (1 marker, 2 panel)  */
+    kWWakeReqs          = 799,       /* SET/CLEAR_FEATURE(DEVICE_REMOTE_WAKEUP) sent       */
+    kWWakeReqRc         = 800,       /* 0x10000 | (UInt16) status of the last one          */
+    kWWakeStatus        = 801,       /* 0x10000 | GET_STATUS after it; 0x20000|err = failed */
+    kWWakeAfterWake     = 802,       /* ... and as read right after the last wake          */
+    kWWakeSleeps        = 803,       /* sleep demands the wake recorder saw                */
+    kWWakeWakes         = 804,       /* wake notifications it saw                          */
+    kWWakeRing0         = 805,       /* 8 sleeps x 4 words, slot = (sleep - 1) % 8; see    */
+    kWWakeRingEnd       = 836,       /* BT_WakeRecPacket for the layout                    */
+
+    kWEnd = 837,                     /* 'ENDS' */
 
     /* ⚠⚠⚠ DERIVED, NEVER TYPED. THIS WAS A SYSTEM HEAP SCRIBBLER IN 14.6.
      *
@@ -1970,6 +2013,9 @@ BT_ASSERT(bt_piperefs_below_end, kWPipeChainErr < kWEnd);
 /* v10.0: the role/actCount words are the new tail. This is now the assert that breaks
  * first if the block grows again without kWEnd moving with it. */
 BT_ASSERT(bt_role_below_end, kWAclOutReq < kWEnd);
+/* btwake1: the wake ring is the new tail -- 8 sleeps x 4 words, ending on its LAST word. */
+BT_ASSERT(bt_wakering_fits,      kWWakeRing0 + kWakeRecSlots * 4 - 1 == kWWakeRingEnd);
+BT_ASSERT(bt_wakering_below_end, kWWakeRingEnd < kWEnd);
 /* M5: the consumer ring is the new tail. ⚠ Its LAST slot, not its first. */
 BT_ASSERT(bt_consring_fits, kWHidConsRing + kHidConsumerRing - 1 == kWHidConsRingEnd);
 BT_ASSERT(bt_consring_below_end, kWHidConsRingEnd < kWEnd);
@@ -2066,7 +2112,12 @@ enum {
      * put. ⚠ Keep the NUMBER stable; the panel is built separately. */
     kCmdDisconnect   = 8,
     /* ★★★★ v12.8: release the block set by Disconnect. ⚠ Keep the NUMBER stable. */
-    kCmdAllowDevice  = 9
+    kCmdAllowDevice  = 9,
+    /* ★★★★★★ btwake1: "Allow Bluetooth devices to wake this computer". Arg0 = 1 allow,
+     * 0 not. The panel has already created or deleted the Preferences marker the driver
+     * reads at load; this applies the choice NOW, without a restart.
+     * ⚠ Keep the NUMBER stable; the panel is a separately built binary. */
+    kCmdSetWake      = 10
 };
 
 /* Designated initialisers, so the magic and terminator are in the FILE as well
@@ -2120,7 +2171,7 @@ static void EnsureBlock(void)
 
         for (p = (unsigned long *)((lo + 3) & ~3UL); p < lim; p++) {
             if (p[kWMagic] == 0x42545031UL &&
-                p[kWBuild] == 0x76483630UL &&      /* 'vH60' -- THIS build only */
+                p[kWBuild] == 0x76493630UL &&      /* 'vI60' -- THIS build only */
                 p[kWEnd]   == 0x454E4453UL) {
                 gCB = p;                           /* adopt it; do NOT re-zero */
                 return;
@@ -2133,7 +2184,7 @@ static void EnsureBlock(void)
 
     for (i = 0; i < kWCount; i++) gCB[i] = 0;
     gCB[kWMagic] = 0x42545031UL;   /* 'BTP1' */
-    gCB[kWBuild] = 0x76483630UL;   /* 'vH60'. ⚠ MUST match the tag EnsureBlock scans
+    gCB[kWBuild] = 0x76493630UL;   /* 'vI60'. ⚠ MUST match the tag EnsureBlock scans
                                     * for above, or instances will never adopt each
                                     * other's block and the interlock silently fails.
                                     * BTCheck matches ONLY the leading 'v'
@@ -2269,6 +2320,142 @@ static void InitPB(USBPB *pb, USBDeviceRef ref, USBCompletion done)
     pb->usbReference  = ref;
     pb->usbCompletion = done;
     pb->usbStatus     = noErr;
+}
+
+/* ======================================================================= */
+/*  btwake1: "Allow Bluetooth devices to wake this computer"                */
+/* ======================================================================= */
+
+/* ★★★★★★ btwake1: TIGER'S WAKE OPTION, AND THE ONE PIECE OF IT THAT WAS MISSING.
+ *
+ * ⭐ MEASURED 2026-11-16 (Run 2 Part 2, logs/uwake17A-bt2-a1044-hw-2026-11-16): through a
+ * 9.5-minute Mode A sleep the A1044 stayed in HCI mode and KEPT BOTH ACL LINKS UP (links
+ * down 0, no reconnect after the wake), so a key press on the A1016 does reach the module
+ * while the Mac sleeps. What the module cannot do is tell the Mac: it is remote-wakeup
+ * capable (bmAttributes E0) and its remote wakeup reads OFF (GET_STATUS 0001) in every
+ * survey. Apple's stack arms it only in HID-proxy mode (05AC:1000, status 0003, the set-up
+ * boot); in HCI mode it is OUR device, and nothing arms it. Under Tiger the same module in
+ * HCI mode woke this Mac from a key press (docs/TIGER-UI-REFERENCE.md §5).
+ *
+ * ⇒ So: SET_FEATURE(DEVICE_REMOTE_WAKEUP) on the module when the user allows it, and
+ * CLEAR_FEATURE when not, each followed by a GET_STATUS so the log says what the module
+ * actually holds. Applied at bind (from the Preferences marker read in ProbeInitialize), at
+ * once when the panel's checkbox changes (kCmdSetWake), and re-checked after every wake --
+ * the status is read BEFORE re-applying there, so a module that lost its arming in a sleep
+ * is a measurement, not something the re-apply quietly papers over.
+ *
+ * ⚠ The host side is not ours. A wake also needs the USB host controller armed: on KeyLargo
+ * Macs Apple's stack does it; on the FW800's NEC it is Sleep Assistant (uwake18A arms the
+ * function hosting a Bluetooth controller; until then, a wired keyboard on fn0 armed it).
+ *
+ * ⚠ SENT FROM THE PUMP TIMER, never from the completion. The next step is issued one tick
+ * later, after the USL has finished with gWakePB, and only while no HCI command holds the
+ * default pipe -- the request shares it with every HCI command (Sleep Assistant's surveys
+ * already put standard requests on it beside our HCI traffic, without incident).
+ * ⚠ Interrupt level: plain stores, InitPB, and USBDeviceRequest, which the HCI command path
+ * already calls from here. */
+unsigned long gWakeAllowed, gWakeSrc, gWakeApplyPending;
+unsigned long gWakeReqs, gWakeReqRc, gWakeStatus, gWakeAfterStatus;
+static unsigned long  gWakeAfterPending;       /* a wake: read the status, then re-apply  */
+static unsigned long  gWakeAfterDelay;         /* pump ticks left before that (~3 s)      */
+static USBPB          gWakePB;
+static unsigned char  gWakeBuf[2];
+static volatile int   gWakeBusy;               /* the USL owns gWakePB                     */
+static int            gWakeStep;               /* the step in flight: kWakeSt*             */
+static int            gWakeNext;               /* the step the next tick should send       */
+static volatile int   gWakeReady;              /* ConfigDone has run: the device is ours   */
+enum { kWakeStNone = 0, kWakeStStatusBefore = 1, kWakeStApply = 2, kWakeStStatusAfter = 3 };
+
+static void WakeCompletion(USBPB *pb);
+
+static void WakeIssue(int step)
+{
+    OSStatus err;
+
+    InitPB(&gWakePB, gDevice, WakeCompletion);
+    gWakePB.usb.cntl.WIndex = 0;
+    if (step == kWakeStApply) {
+        gWakePB.usb.cntl.BMRequestType = USBMakeBMRequestType(kUSBOut, kUSBStandard, kUSBDevice);
+        gWakePB.usb.cntl.BRequest      = gWakeAllowed ? kUSBRqSetFeature : kUSBRqClearFeature;
+        gWakePB.usb.cntl.WValue        = kUSBFeatureDeviceRemoteWakeup;
+        gWakePB.usbBuffer              = nil;
+        gWakePB.usbReqCount            = 0;
+        gWakeReqs++;
+    } else {
+        gWakePB.usb.cntl.BMRequestType = USBMakeBMRequestType(kUSBIn, kUSBStandard, kUSBDevice);
+        gWakePB.usb.cntl.BRequest      = kUSBRqGetStatus;
+        gWakePB.usb.cntl.WValue        = 0;
+        gWakeBuf[0] = gWakeBuf[1] = 0;
+        gWakePB.usbBuffer              = gWakeBuf;
+        gWakePB.usbReqCount            = 2;
+    }
+    gWakeStep = step;
+    gWakeBusy = 1;
+    err = USBDeviceRequest(&gWakePB);
+    if (err != noErr && err != kUSBPending) {
+        /* ⚠ The completion will never run: release the PB here, and record the refusal
+         * where that step's result would have gone. */
+        unsigned long r = 0x20000UL | ((unsigned long)err & 0xFFFFUL);
+        gWakeBusy = 0;
+        gWakeStep = kWakeStNone;
+        if (step == kWakeStApply) gWakeReqRc = r;
+        else if (step == kWakeStStatusBefore) gWakeAfterStatus = r;
+        else gWakeStatus = r;
+    }
+}
+
+static void WakeCompletion(USBPB *pb)
+{
+    int step = gWakeStep;
+    unsigned long v;
+
+    /* A status read is the two bytes it returned (bit 1 = remote wakeup); a failure is
+     * 0x20000 | the error, so it can never read as a status. */
+    if (pb->usbStatus == noErr)
+        v = 0x10000UL | (unsigned long)gWakeBuf[0] | ((unsigned long)gWakeBuf[1] << 8);
+    else
+        v = 0x20000UL | ((unsigned long)pb->usbStatus & 0xFFFFUL);
+
+    if (step == kWakeStStatusBefore) {
+        gWakeAfterStatus = v;
+        gWakeNext = kWakeStApply;
+    } else if (step == kWakeStApply) {
+        gWakeReqRc = 0x10000UL | ((unsigned long)pb->usbStatus & 0xFFFFUL);
+        gWakeNext = kWakeStStatusAfter;
+    } else if (step == kWakeStStatusAfter) {
+        gWakeStatus = v;
+        gWakeNext = kWakeStNone;
+    }
+    gWakeStep = kWakeStNone;
+    gWakeBusy = 0;               /* ⚠ LAST: the PB is free only after the reads above */
+}
+
+/* From the pump timer, one request per tick at most. */
+static void BT_WakePump(void)
+{
+    int s;
+
+    /* ⚠ A wake's re-check waits ~3 s (30 ticks of 100 ms): right after the wake the USB
+     * stack is still resuming the bus, and a request refused then would read as a module
+     * that lost its arming. */
+    if (gWakeAfterDelay > 0 && --gWakeAfterDelay == 0) gWakeAfterPending = 1;
+    if (!gWakeReady || gWakeBusy || gCmdBusy || gDevice == kNoDeviceRef || gDeviceGone) return;
+    if (gWakeNext != kWakeStNone) {
+        s = gWakeNext;
+        gWakeNext = kWakeStNone;
+        WakeIssue(s);
+        return;
+    }
+    if (gWakeAfterPending) {
+        gWakeAfterPending = 0;
+        gWakeApplyPending = 0;   /* the sequence it starts re-applies anyway */
+        WakeIssue(kWakeStStatusBefore);
+        return;
+    }
+    if (gWakeApplyPending) {
+        gWakeApplyPending = 0;
+        WakeIssue(kWakeStApply);
+    }
 }
 
 /* ======================================================================= */
@@ -2733,6 +2920,15 @@ static void BT_ServiceMailbox(void)
         gCB[kWCmdResult] = 0x100UL | 0UL;
         break;
 
+    case kCmdSetWake:
+        /* ★ btwake1: record the choice; BT_WakePump sends the request from this same
+         * timer, next tick, once nothing else holds the module's default pipe. */
+        gWakeAllowed      = (a0 != 0) ? 1UL : 0UL;
+        gWakeSrc          = 2UL;
+        gWakeApplyPending = 1UL;
+        gCB[kWCmdResult]  = 0x100UL | 0UL;
+        break;
+
     case kCmdDisconnect:
         /* ⚠ Link only. No key is touched, by design -- that is the whole distinction
          * from Delete, and conflating them is what this command exists to undo. */
@@ -2841,6 +3037,8 @@ static OSStatus bt_pump_timer_sih(void *p1, void *p2)
 
     gTimerRuns++;
     BT_ServiceMailbox();
+    /* btwake1: the module's remote wakeup, one request per tick. See BT_WakePump. */
+    BT_WakePump();
     /* ⚠ Retried from here rather than sent once from an event, because a refused send
      * must not latch. See BT_TryStoredKeyProbe: the first version latched before the
      * send and consequently never fired at all. */
@@ -3176,6 +3374,7 @@ void BT_StackPoll(unsigned long state)
             Note(kWBadCmdRing + k, gBadCmdRing[k]);
     }
     NoteKeep(kWPairPath,       gPairPath);
+    NoteKeep(kWPairDeferred,   gPairDeferCount);     /* a1044pair1 */
     Note(kWLinkWasUp,      gLinkWasUp);
     Note(kWArmedFired,     gArmedFired);
     Note(kWArmedRc,        gArmedRc);
@@ -3542,8 +3741,29 @@ void BT_StackPoll(unsigned long state)
         }
         Note(kWBatTargets,     gBatTargets);
         Note(kWBatGiveUps,     gBatGiveUps);
+        Note(kWBatOpenKicks,   gBatOpenKicks);    /* v18.5 */
+        Note(kWBatSchedRuns,   gBatSchedRuns);
+        Note(kWBatLastElig,    gBatLastElig);
+        Note(kWBatArmNoop,     gBatArmNextNoop);
         Note(kWCurAccelUsed,   (unsigned long)gCurAccelUsed);
         Note(kWCurDevPtr,      (unsigned long)gCurDevPtr);
+        Note(kWAdbDiagPtr,     BT_MouseDiagRefresh());   /* adbhook2 */
+        Note(kWAclRxBadLen,    gAclRxBadLen);            /* aclread1 */
+        Note(kWAclRxBadLast,   gAclRxBadLast);
+        /* btwake1: the wake option, what the module reported, and the per-sleep record */
+        Note(kWWakeOpt,        0x100UL | (gWakeAllowed & 1UL) | ((gWakeSrc & 0xFUL) << 4));
+        Note(kWWakeReqs,       gWakeReqs);
+        Note(kWWakeReqRc,      gWakeReqRc);
+        Note(kWWakeStatus,     gWakeStatus);
+        Note(kWWakeAfterWake,  gWakeAfterStatus);
+        Note(kWWakeSleeps,     gWakeRecSleeps);
+        Note(kWWakeWakes,      gWakeRecWakes);
+        {
+            short ws, wk;
+            for (ws = 0; ws < kWakeRecSlots; ws++)
+                for (wk = 0; wk < 4; wk++)
+                    Note((short)(kWWakeRing0 + ws * 4 + wk), gWakeRec[ws][wk]);
+        }
         Note(kWCurAccelErr,    (unsigned long)gCurAccelErr);
         Note(kWCurButtonsErr,  (unsigned long)gCurButtonsErr);
         Note(kWCurUpiErr,      (unsigned long)gCurUpiErr);
@@ -3563,7 +3783,9 @@ void BT_StackPoll(unsigned long state)
         Note(kWMouseRidOther,  gMouseRidOther);
         Note(kWBhReconnTried,  gBhReconnTried);
         Note(kWBhReconnRc,     gBhReconnRc);
-        Note(kWHidOutGate,     (unsigned long)kHidOutgoingConnect);
+        Note(kWHidOutGate,     (unsigned long)kHidOutgoingConnect
+                             | ((gHidOutSkipped > 255UL ? 255UL : gHidOutSkipped) << 8)
+                             | ((gHidOutByTimer > 255UL ? 255UL : gHidOutByTimer) << 16));
         Note(kWHidOutTried,    gHidOutTried);
         Note(kWHidOutRc,       gHidOutRc);
         Note(kWHidOutCid,      gHidOutCid);
@@ -3958,11 +4180,42 @@ static void ConfigDone(void)
      * level -- it is DriverServicesLib, the same library as
      * CallSecondaryInterruptHandler2, which this file already calls from here. */
     BT_StartPumpTimerIrq();
+    /* btwake1: the device is ours and configured; the remote-wakeup choice read in
+     * ProbeInitialize can go out on the next pump tick. */
+    gWakeReady = 1;
 }
 
 /* ======================================================================= */
 /*  M0.3 -- ACL data over the bulk pipes. The L2CAP layer at M2 sits on this. */
 /* ======================================================================= */
+
+/* ★★★★★★ aclread1: ONE BULK-IN READ IN FLIGHT, EVER. Set when the USL accepts the
+ * read, cleared when its completion runs, and cleared at every new bind next to
+ * gAclLinks (a read the old instance never saw complete must not latch the new one).
+ *
+ * ⚠⚠ WITHOUT IT, EVERY LINK-UP STACKED ANOTHER READ ON THE SAME PB AND THE SAME
+ * BUFFER. BT_AclLinkUp armed unconditionally, on the premise in bt_pump.h that an idle
+ * read completes empty and the reader parks (run 51). Under Apple's USB stack on the
+ * FW800 that never happens (`empty ACL reads 0`, `ACL re-arms parked 0`), so the read
+ * ConfigDone posted was still waiting at the first link-up, and the USL ACCEPTED the
+ * same PB again (`immediate errors 0`). Measured in every banked log: reads armed minus
+ * completions = links up + 1 (2026-11-16: 61 - 58 = 3 with 2 links; 1333 - 1329 = 4
+ * with 3).
+ *
+ * Two reads into one buffer race: the second packet lands before the first one's
+ * completion runs. The DBT-120 runs show the cost exactly. The A1015's L2CAP
+ * Configuration Response arrives as a 17-byte start fragment and a 1-byte
+ * continuation; the inbound capture holds the continuation's header over the start
+ * fragment's tail, delivered at the start fragment's length. BTstack drops it
+ * (hci.c acl_handler: ACL length + 4 != size), then drops the continuation (no first
+ * fragment), so the mouse's answer to our Config Request never reaches L2CAP and the
+ * channel times out with 0x69. The September A1044 sessions carried the same extra
+ * reads and captured cleanly: a race, which that machine's timing happened to win.
+ *
+ * ⚠ One read loses nothing: between a completion and its re-arm the endpoint NAKs and
+ * the controller keeps the packet. That is the USB flow control a single reader relies
+ * on, and the shape this reader had until the link-up arm was added. */
+static Boolean gAclReadOut = false;
 
 /* Re-arm the bulk-IN reader. Bounded by the buffer, never by anything the
  * controller claims. */
@@ -3971,12 +4224,18 @@ static void ArmAclRead(void)
     OSStatus err;
 
     if (gBulkIn == 0 || gDeviceGone) return;
+    /* aclread1: a read is already posted, and it will deliver whatever comes next. */
+    if (gAclReadOut) { Bump(kWAclArmSkipped); return; }
     InitPB(&gAclInPB, gBulkIn, AclInCompletion);
     gAclInPB.usbBuffer   = gAclIn;
     gAclInPB.usbReqCount = kACLBufSize;
     Bump(kWAclArmed);
+    /* ⚠ SET BEFORE THE CALL: a completion can run before USBBulkRead returns, and it
+     * clears this flag and re-arms; setting it afterwards would overwrite that. */
+    gAclReadOut = true;
     err = USBBulkRead(&gAclInPB);
     if (immediateError(err)) {
+        gAclReadOut = false;     /* refused: nothing is in flight */
         Bump(kWImmErr);
         Say(gDevice, "\pOS9BTProbe: could not arm the ACL bulk read", 0);
         /* ★ THE CLEAR LIVES HERE NOW, on a REFUSED RE-ARM -- which is exactly r23's
@@ -3991,14 +4250,20 @@ static void ArmAclRead(void)
             ClearStall(gBulkIn, kWAclStallClears);
             gAclInPB.usbStatus = noErr;
             Bump(kWAclArmed);
-            if (immediateError(USBBulkRead(&gAclInPB)))
+            gAclReadOut = true;
+            if (immediateError(USBBulkRead(&gAclInPB))) {
+                gAclReadOut = false;
                 Note(kWAclStatusFull, (unsigned long)err);
+            }
         }
     }
 }
 
 static void AclInCompletion(USBPB *pb)
 {
+    /* aclread1: this read is over. Cleared FIRST, so the re-arm at the end posts the
+     * next one and BT_AclLinkUp can arm a parked reader. */
+    gAclReadOut = false;
     Bump(kWAclInComp);
     Note(kWAclInStatus, (unsigned long)pb->usbStatus);
     Note(kWAclInCount,  (unsigned long)pb->usbActCount);
@@ -4084,7 +4349,9 @@ void BT_AclLinkUp(void)
     gAclLinks++;
     Bump(kWAclLinkUps);
     /* Arm immediately: L2CAP signalling follows the connection event closely, and an
-     * unarmed bulk-IN pipe would drop the first packet silently. */
+     * unarmed bulk-IN pipe would drop the first packet silently.
+     * ⚠ aclread1: this ARMS A PARKED READER; it no longer adds a second read when one
+     * is already waiting, which is the normal case on this stack (see gAclReadOut). */
     ArmAclRead();
 }
 
@@ -4925,6 +5192,10 @@ static OSStatus ProbeInitialize(USBDeviceRef device, USBDeviceDescriptorPtr pDes
      * session; the pattern is that a new piece of cross-bind state needs clearing
      * HERE, next to the others. */
     gAclLinks = 0;
+    /* aclread1: and the in-flight flag. A read the previous instance posted belongs to
+     * a pipe that is gone; if its completion never came, the flag would refuse every
+     * arm for the rest of the boot -- a fourth latching guard. */
+    gAclReadOut = false;
 
     gDevice   = device;
     gBusPower = busPower;
@@ -5066,6 +5337,7 @@ static OSStatus ProbeInitialize(USBDeviceRef device, USBDeviceDescriptorPtr pDes
     BT_AlertInit();
     BT_KeyFileLoad();
     BT_LoadShowAllFlag();
+    BT_LoadWakeFlag();       /* btwake1: sets gWakeAllowed and asks for the apply */
 
     /* ★★★★★★ v14.4: ASK FOR ONE TASK-LEVEL HOP, AND THIS IS WHY YOU HAD TO REBOOT TWICE
      * AFTER EVERY DRIVER UPDATE.
@@ -5330,16 +5602,33 @@ static OSStatus ProbeNotify(UInt32 notification, void *pointer, UInt32 refCon)
     }
     if (notification == kNotifySystemSleepRequest ||
         notification == kNotifySystemSleepDemand) {
-        /* ⚠ COUNTED, NOT ACTED ON. Tearing the pipes down here is exactly the bug
-         * above. A sleep request is not a removal, and what this driver should do about
-         * sleep has never been designed -- so record it and say so rather than guess. */
+        /* ⚠ COUNTED, NOT ACTED ON, for the pipes. Tearing them down here is exactly the
+         * bug above: a sleep request is not a removal.
+         * ★ adbhook2: the one thing done is the mouse's, at the DEMAND only (a request
+         * can still be revoked): stop using the cursor device, which the wake's
+         * ADBReInit will delete. The first report after the wake makes a new one. */
         Bump(kWNotifySleep);
+        if (notification == kNotifySystemSleepDemand) {
+            BT_MouseSleepNote(kBtMouseNoteDemand);
+            /* btwake1: the first thing the module delivers from here on is what it had
+             * to say when the Mac woke. Plain stores. */
+            BT_WakeRecDemand();
+        }
         return noErr;
     }
     if (notification == kNotifyExpertTerminating) {
         Bump(kWNotifyOther);
         gDeviceGone = true;
         return noErr;
+    }
+    /* adbhook2: the wake. Counted as before; the mouse forgets its record again only if
+     * one was published since the demand without the hook. */
+    if (notification == kNotifySystemSleepWakeUp) {
+        BT_MouseSleepNote(kBtMouseNoteWake);
+        /* btwake1: close this sleep's record, and have the pump read the module's remote
+         * wakeup before re-applying it -- did the arming survive the sleep? */
+        BT_WakeRecWake();
+        gWakeAfterDelay = 30UL;
     }
     Bump(kWNotifyOther);
     return noErr;

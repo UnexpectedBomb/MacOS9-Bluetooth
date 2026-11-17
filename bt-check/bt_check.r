@@ -33,7 +33,7 @@ resource 'SIZE' (-1) {
 
 resource 'vers' (1, "BTCheck") {
     0x99,
-    0x99,                   /* 99.105 -- BCD. ⚠ It had drifted to 26.0 while the target
+    0x99,                   /* 99.110 -- BCD. ⚠ It had drifted to 26.0 while the target
                              * name said v45, so Get Info disagreed with the filename,
                              * and this comment then itself drifted to naming 47.0
                              * while the field above read 0x61. bt_check.c has no copy
@@ -49,6 +49,23 @@ resource 'vers' (1, "BTCheck") {
     release,
     0x00,
     verUS,
-    "99.105",
-    "99.105, expects driver v17.6"
+    "99.110",
+    "99.110"
+};
+
+/* ★ RELEASE 18.6 (user, 2026-11-16): PLAIN VERSIONS, as for every file of the stack.
+ * vers(1) is the number alone; vers(2) names the release. The driver version this build
+ * reads is no longer in Get Info: the log's own banner states it (kExpectedDriverTag),
+ * which is where a mismatch is actually diagnosed.
+ * ⚠ The BCD pair above stays pinned at 0x99/0x99 (see the note there), so ASP's Version
+ * column reads "99.9.9" for BTCheck: BCD cannot spell 99.110. Get Info and the log are
+ * the places this tool's version is read. */
+resource 'vers' (2, "BTCheck") {
+    0x99,
+    0x99,
+    release,
+    0x00,
+    verUS,
+    "99.110",
+    "OS 9 Bluetooth 18.6"
 };

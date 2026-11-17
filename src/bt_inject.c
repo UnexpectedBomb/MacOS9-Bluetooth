@@ -24,10 +24,12 @@
 #include <Traps.h>       /* _Unimplemented = 0xA89F                              */
 #include <MixedMode.h>   /* CallUniversalProc                                    */
 #include <CursorDevices.h> /* the mouse path -- see BT_InjectMouse               */
+#include <OSUtils.h>     /* MakeDataExecutable -- adbhook1's 68K island          */
 
 #include "bt_bootreport.h"
 #include "bt_inject.h"
 #include "bt_defer.h"    /* the sanctioned interrupt -> task hop */
+#include "bt_adbdiag.h"  /* adbhook2: the wake hook's record, shared with BTCheck */
 
 unsigned long gInjInitRuns, gInjKchrOk, gInjKchrErr, gInjEvents, gInjPosted;
 unsigned long gInjNoVk, gInjNoKchr, gInjNoChar, gInjLastUsage, gInjLastVk, gInjPostErr;
@@ -719,8 +721,19 @@ void BT_MediaServiceAtTask(void)
  * -- without it the compiler may cache the flag in a register across the task-level read
  * and the device is never created, or is created twice. */
 static volatile short  gCurWant;        /* a report arrived with no device yet */
-static CursorDevicePtr gCurDev;
+/* ⚠ adbhook1: volatile -- the JADBProc hook clears and replaces it inside ADBReInit. */
+static CursorDevicePtr volatile gCurDev;
 static unsigned char   gCurButtons;     /* remembered mask, for the change diff */
+/* adbhook1 (see the block above BtADBProc): the record we stopped using when ADBReInit
+ * announced itself, which it then frees, and that record's acceleration -- the user's
+ * tracking speed, read while it was still live, for the record that replaces it. */
+static CursorDevicePtr gCurDevPrev;
+static Fixed           gCurAccelSaved;
+/* adbhook2: every counter the hook and its fallback keep, in the layout BTCheck reads
+ * (src/bt_adbdiag.h). Zero until stamped; the block word kWAdbDiagPtr points here. */
+static volatile unsigned long gAdbDiag[kAdWords];
+enum { kForgetByHook = 0, kForgetAtDemand = 1, kForgetAtWake = 2 };   /* CurDevForget */
+enum { kRebindInHook = 0, kRebindAtTask = 1 };                        /* CurDevRebind */
 
 long gCurMoveErr, gCurBtnErr;   /* 0x10000 | OSErr, first failure only */
 long gCurAccelErr, gCurButtonsErr, gCurUpiErr;  /* v16.2: the setup calls' verdicts */
@@ -734,6 +747,10 @@ unsigned long gMouseWheelSeen, gCurNewErr, gCurCreated;
 void BT_InjectMouse(short dx, short dy, unsigned char buttons, short wheel)
 {
     unsigned char b = (unsigned char)(buttons & 0x07);
+    /* ⚠ adbhook1: READ THE POINTER ONCE. The JADBProc hook clears it before ADBReInit
+     * frees the record and publishes a new one after; both calls below must use the
+     * same record, the one this check saw. */
+    CursorDevicePtr dev = gCurDev;
 
     gMouseReports++;
     /* ⚠ COUNTED, NOT INJECTED. Apple's own mouse module has no wheel path and the
@@ -743,10 +760,11 @@ void BT_InjectMouse(short dx, short dy, unsigned char buttons, short wheel)
      * being silently dropped and later rediscovered. */
     if (wheel != 0) gMouseWheelSeen++;
 
-    if (gCurDev == 0) {
-        /* No device yet: ask for the task-level hop that can make one, and drop this
-         * report. BT_DeferRequest only ENQUEUES and coalesces, so calling it on every
-         * dropped report is safe and costs one notification. */
+    if (dev == 0) {
+        /* No device yet (or, adbhook1, none while ADBReInit replaces it, or a rebind
+         * that failed there): ask for the task-level hop that can make one, and drop
+         * this report. BT_DeferRequest only ENQUEUES and coalesces, so calling it on
+         * every dropped report is safe and costs one notification. */
         gMouseDropped++;
         gCurWant = 1;
         BT_DeferRequest();
@@ -760,30 +778,34 @@ void BT_InjectMouse(short dx, short dy, unsigned char buttons, short wheel)
     if (dx != 0 || dy != 0) {
         OSErr e;
         gMouseMoves++;
-        e = CursorDeviceMove(gCurDev, (long)dx, (long)dy);
+        e = CursorDeviceMove(dev, (long)dx, (long)dy);
         if (e != noErr && gCurMoveErr == 0) gCurMoveErr = 0x10000L | (long)(short)e;
     }
     if (b != gCurButtons) {
         OSErr e;
         gMouseBtnChanges++;
-        e = CursorDeviceButtons(gCurDev, (short)b);
+        e = CursorDeviceButtons(dev, (short)b);
         if (e != noErr && gCurBtnErr == 0) gCurBtnErr = 0x10000L | (long)(short)e;
         gCurButtons = b;
     }
 }
 
-/* ⚠ TASK LEVEL ONLY, from the defer response beside BT_MediaServiceAtTask.
- * CursorDeviceNewDevice allocates. */
-void BT_MouseServiceAtTask(void)
+/* 'BTMS' in our record's refCon (adbhook1): ours, not a reused address. */
+#define kCurDevMagic 0x42544D53UL
+
+/* Make + configure a CursorDevice. TASK LEVEL, or (adbhook1) INSIDE ADBReInit, which is
+ * where Apple's own sample makes its replacement (HIDEmulation.c:296-306): it allocates,
+ * and it never touches the File Manager. accel 0 = INHERIT the machine's acceleration
+ * (the long note below); any other value is used as given -- a rebind passes the
+ * replaced record's, which is the user's tracking setting. Returns 0 on failure,
+ * counted in gCurNewErr. It does NOT publish: each caller stores gCurDev LAST. */
+static CursorDevicePtr CurDevMake(Fixed accel)
 {
     CursorDevicePtr dev = 0;
 
-    if (!gCurWant || gCurDev != 0) return;
-    gCurWant = 0;
-
     if (CursorDeviceNewDevice(&dev) != noErr || dev == 0) {
         gCurNewErr++;
-        return;                       /* ⚠ fail open: gCurDev stays 0, reports keep
+        return 0;                     /* ⚠ fail open: gCurDev stays 0, reports keep
                                        * being dropped and counted, nothing crashes */
     }
     /* Apple's setup, same order AND -- as of v16.3 -- genuinely the same values.
@@ -842,10 +864,14 @@ void BT_MouseServiceAtTask(void)
      * established. Worth keeping as a reminder that "the fix worked" is not evidence
      * that the reasoning behind it did. */
     {
+        /* adbhook1: a rebind passes the replaced record's acceleration and skips the
+         * scan. That value is what this mouse was actually running -- inherited at
+         * creation, then whatever the Mouse control panel pushed onto it since -- which
+         * is the one to keep (the OHCI companion's adbhook1 does the same). */
         CursorDevicePtr scan = NULL;
-        Fixed inherited = (Fixed)(1L << 16);
+        Fixed inherited = (accel != 0) ? accel : (Fixed)(1L << 16);
         short guard = 0;
-        if (CursorDeviceNextDevice(&scan) == noErr) {
+        if (accel == 0 && CursorDeviceNextDevice(&scan) == noErr) {
             while (scan != NULL && guard < 8) {
                 if (scan != dev && scan->acceleration != 0) {
                     inherited = scan->acceleration;
@@ -891,23 +917,355 @@ void BT_MouseServiceAtTask(void)
      * not, and nobody checked. */
     gCurUpiErr = (long)CursorDeviceUnitsPerInch(dev, (Fixed)(400L << 16));
 
-    /* ⚠ PUBLISH LAST. Until this store, BT_InjectMouse at interrupt level sees no device
-     * and drops reports -- which is correct. Storing the pointer before the device is
-     * configured would let an interrupt use a half-set-up device. */
-    gCurDevPtr = (long)dev;
-    gCurDev = dev;
+    /* adbhook1: stamp it ours. A freed record's address can be handed to another
+     * driver's device, so "is our old record still on the list" is decided by this
+     * stamp, and it is read only from a record the list still holds (CurDevListed). */
+    dev->refCon = (long)kCurDevMagic;
     gCurCreated++;
+    return dev;
+}
+
+/* ⚠ PUBLISH LAST, for every caller. Until this store BT_InjectMouse at interrupt level
+ * sees no device and drops reports -- which is correct. Storing the pointer before the
+ * device is configured would let an interrupt use a half-set-up device. */
+static void CurDevPublish(CursorDevicePtr dev)
+{
+    gCurButtons = 0;                  /* no button is down on a fresh record */
+    gCurDevPtr  = (long)dev;
+    __asm__ volatile ("sync" ::: "memory");
+    gCurDev = dev;
+}
+
+/* ================================================================================
+ *  adbhook1: A LIVE CursorDevice ACROSS ADBReInit, WHICH EVERY DEEP-SLEEP WAKE RUNS.
+ * ================================================================================
+ *
+ * ★ SEEN ON THE FW800, 2026-11-15 (DBT-120, A1016 + A1015, Sleep Assistant mode A):
+ * after an idle sleep and a wake the A1016 typed, media keys included, and the A1015
+ * CLICKED BUT NEVER MOVED THE CURSOR. Predicted on 2026-10-24 and written down then
+ * (reference_os9_adbreinit_deletes_cursor_devices): every OS 9 wake runs ADBReInit,
+ * and the Cursor Device Manager deletes EVERY CursorDevice in it. The record this file
+ * made once, at the first report, was from then on a freed block: CursorDeviceMove on
+ * it returns noErr, moves nothing and WRITES INTO THE FREED RECORD on every report
+ * (measured in QEMU, firewire-fw800/cdm-probe), and BT_MouseFinalize would later have
+ * disposed it a second time. CursorDeviceButtons on it still delivers clicks -- the
+ * one new fact the hardware run added.
+ *
+ * ⭐ PRIOR ART, COPIED RATHER THAN DERIVED. Apple's own USB mouse driver hooks the
+ * low-memory JADBProc (0x06B8) for exactly this: usb-ddk/Examples/MouseModule/
+ * HIDEmulation.c:314 ChainJADBProc -- "As a result of ADBReInit(), any CursorDevice
+ * records are deleted. So, we'll hook ourselves into JADBProc, and recreate our
+ * CursorDevice record whenever ADBReInit has completed." This project's OHCI companion
+ * carries the same hook (firewire-fw800/ohci-companion, adbhook1), and FW800 wake
+ * Run 10 proved it on this Mac. What follows is that code, adapted to two things this
+ * driver has and the companion does not: the record is made on demand at the first
+ * report (so a machine that never connects a mouse gets no hook), and the fragment can
+ * be unloaded (so BT_MouseFinalize must take the hook out again: the routine
+ * descriptor points into this fragment).
+ *
+ * ADBReInit calls JADBProc twice: D0 = 0 just before the Cursor Device Manager drops
+ * its devices, D0 != 0 after (QEMU, cdm-probe). Before: stop using the record --
+ * BT_InjectMouse then drops reports -- and keep its acceleration. After: make a new
+ * record with that acceleration, unless the old one is still on the list and still
+ * ours. If that allocation fails, gCurDevPrev stays set and the next dropped report's
+ * task-level service makes the record instead.
+ *
+ * ⚠ BtADBProc RUNS INSIDE ADBReInit, in the wake sequence. Its callees are
+ * CurDevForget (no Toolbox), CurDevRebind -> CurDevListed (CursorDeviceNextDevice) and
+ * CurDevMake (the Cursor Device Manager only). NO FILE MANAGER may ever be added here.
+ * It is not an interrupt-level entry point, so scripts/level-audit.py does not root at
+ * it; this list is the audit, checked by hand. */
+#define kLMJADBProc  (*(volatile UInt32 *)0x06B8)
+
+static UInt16           *gAdbIsland;     /* 24 bytes, system heap: JSR gAdbRD; JMP old; NOPs */
+static UniversalProcPtr  gAdbRD;
+static UInt32            gAdbOld;        /* JADBProc before us */
+static short             gAdbHooked;     /* 1 = chained in; 0 = not (retried at task level) */
+static long              gAdbFlushErr;   /* 0x10000 | OSErr of FlushCodeCacheRange, first only */
+
+/* The island is 68K code, run by the emulator. ⚠ In this driver BlockMove resolves to
+ * DRIVERSERVICESLIB's (link order; the OHCI companion's does too), while Apple's sample
+ * relies on the TOOLBOX BlockMove flushing the emulator's code cache ("BlockMove will
+ * flush the DR cache then", HIDEmulation.c). So flush explicitly: FlushCodeCacheRange,
+ * InterfaceLib 8.5 and later. Installing writes fresh memory, which is why the
+ * companion never needed this; UNCHAINING rewrites an island that has already run, and
+ * a stale translation of its old JSR would call a routine descriptor that is gone. */
+static void AdbIslandFlush(void)
+{
+    OSErr e;
+    MakeDataExecutable(gAdbIsland, (UInt32)(12 * sizeof(UInt16)));
+    e = FlushCodeCacheRange(gAdbIsland, (unsigned long)(12 * sizeof(UInt16)));
+    if (e != noErr && gAdbFlushErr == 0) gAdbFlushErr = 0x10000L | (long)(short)e;
+}
+
+/* Is `want` still on the Cursor Device Manager's list AND still ours? Only a record the
+ * list still holds is read, so a freed one is never dereferenced. Task level or inside
+ * ADBReInit. */
+static int CurDevListed(CursorDevicePtr want)
+{
+    CursorDevicePtr d = NULL;
+    short guard = 0;
+    if (want == 0 || CursorDeviceNextDevice(&d) != noErr) return 0;
+    while (d != NULL && guard++ < 16) {
+        if (d == want) return want->refCon == (long)kCurDevMagic;
+        if (CursorDeviceNextDevice(&d) != noErr) break;
+    }
+    return 0;
+}
+
+/* Stop using our record: ADBReInit is about to free it (the hook's pre-call), or the
+ * Mac is going to sleep (adbhook2: the Expert's demand) or has woken (its wake notice).
+ * ANY level, no Toolbox. `src` only says which, for the record. */
+static void CurDevForget(int src)
+{
+    CursorDevicePtr d = gCurDev;
+    if (d == 0) return;
+    gCurDev = 0;                      /* first: from here on reports are dropped */
+    __asm__ volatile ("sync" ::: "memory");
+    gCurAccelSaved = d->acceleration; /* the user's speed (live at the hook and the demand) */
+    gCurDevPrev    = d;
+    gAdbDiag[kAdAccelSaved] = (unsigned long)gCurAccelSaved;
+    if      (src == kForgetByHook)   gAdbDiag[kAdForgetHook]++;
+    else if (src == kForgetAtDemand) gAdbDiag[kAdForgetDemand]++;
+    else                             gAdbDiag[kAdForgetWake]++;
+}
+
+/* A live record again: inside ADBReInit (the hook's post-call) or at task level (the
+ * first dropped report after a forget). Keeps the old one if the Cursor Device Manager
+ * still lists it as ours, else makes a new one. No File Manager. */
+static void CurDevRebind(int src)
+{
+    CursorDevicePtr dev;
+    if (gCurDev != 0 || gCurDevPrev == 0) return;     /* nothing was forgotten */
+    if (src == kRebindInHook) gAdbDiag[kAdRebindHook]++;
+    else                      gAdbDiag[kAdRebindTask]++;
+    if (CurDevListed(gCurDevPrev)) {
+        dev = gCurDevPrev;
+        gAdbDiag[kAdKept]++;
+    } else {
+        /* adbhook2: a forget at the wake notice can come after ADBReInit freed the record,
+         * so the acceleration it read may be garbage. 0 = inherit from another device,
+         * which the Mouse control panel has set to the same value. */
+        Fixed a = gCurAccelSaved;
+        if (a < 0 || a > (Fixed)(4L << 16)) { a = 0; gAdbDiag[kAdAccelReset]++; }
+        dev = CurDevMake(a);
+        if (dev == 0) { gAdbDiag[kAdFail]++; return; } /* gCurDevPrev stays: retried */
+        gAdbDiag[kAdMade]++;
+    }
+    gCurDevPrev = 0;
+    gAdbDiag[kAdRebindTick] = TickCount();
+    CurDevPublish(dev);
+}
+
+enum {
+    kJADBProcInfo = kRegisterBased
+                  | RESULT_SIZE(SIZE_CODE(sizeof(UInt32)))
+                  | REGISTER_RESULT_LOCATION(kRegisterD0)
+                  | REGISTER_ROUTINE_PARAMETER(1, kRegisterD0, SIZE_CODE(sizeof(UInt32)))
+};
+
+/* ⚠ INSIDE ADBReInit, through our 68K island. Returns D0 unchanged for the next hook. */
+static UInt32 BtADBProc(UInt32 state)
+{
+    if (state == 0) {
+        gAdbDiag[kAdPreN]++;  gAdbDiag[kAdPreTick]  = TickCount(); CurDevForget(kForgetByHook);
+    } else {
+        gAdbDiag[kAdPostN]++; gAdbDiag[kAdPostTick] = TickCount(); CurDevRebind(kRebindInHook);
+    }
+    return state;
+}
+
+/* TASK LEVEL: chain BtADBProc in front of JADBProc -- Apple's ChainJADBProc, with the
+ * island laid out by hand as a UInt16 array, because Retro68's gcc ignores
+ * `#pragma options align=mac68k` and a struct would pad the address to offset 4.
+ * A failed allocation leaves gAdbHooked 0 and is retried on the next call: a guard
+ * that latched here would leave the mouse dead after every wake for the session. */
+static void AdbHookInstall(void)
+{
+    UInt16 isl[12];
+    THz    z;
+    int    i;
+
+    if (gAdbHooked) return;
+    z = GetZone();
+    SetZone(SystemZone());            /* the defer response runs in the front app's zone */
+    if (gAdbRD == 0)
+        gAdbRD = NewRoutineDescriptor((ProcPtr)BtADBProc, kJADBProcInfo,
+                                      GetCurrentArchitecture());
+    if (gAdbIsland == 0) gAdbIsland = (UInt16 *)NewPtrSysClear((Size)sizeof(isl));
+    SetZone(z);
+    if (gAdbRD == 0 || gAdbIsland == 0) return;
+
+    gAdbOld = kLMJADBProc;
+    isl[0] = 0x4EB9;                                              /* JSR rd.L  */
+    isl[1] = (UInt16)((UInt32)gAdbRD >> 16);
+    isl[2] = (UInt16)((UInt32)gAdbRD & 0xFFFFUL);
+    if (gAdbOld != 0) {
+        isl[3] = 0x4EF9;                                          /* JMP old.L */
+        isl[4] = (UInt16)(gAdbOld >> 16);
+        isl[5] = (UInt16)(gAdbOld & 0xFFFFUL);
+    } else {
+        isl[3] = 0x4E75; isl[4] = 0x4E71; isl[5] = 0x4E71;        /* RTS       */
+    }
+    for (i = 6; i < 12; i++) isl[i] = 0x4E71;
+    BlockMove(isl, gAdbIsland, (Size)sizeof(isl));
+    AdbIslandFlush();                 /* before the hook is reachable */
+    kLMJADBProc = (UInt32)gAdbIsland;
+    gAdbHooked = 1;
+    /* adbhook2: what was chained, where, and whether the write took */
+    gAdbDiag[kAdIsland]      = (unsigned long)gAdbIsland;
+    gAdbDiag[kAdRD]          = (unsigned long)gAdbRD;
+    gAdbDiag[kAdOld]         = (unsigned long)gAdbOld;
+    gAdbDiag[kAdInstallTick] = TickCount();
+    gAdbDiag[kAdInstallRead] = (unsigned long)kLMJADBProc;
+    gAdbDiag[kAdFlushErr]    = (unsigned long)gAdbFlushErr;
+    gAdbDiag[kAdHooked]      = 1;
+}
+
+/* TASK LEVEL, from BT_MouseFinalize: no ADBReInit may call into this fragment after it
+ * goes. If nobody chained after us, restore JADBProc and free the island; otherwise
+ * leave the island in the chain as a pure JMP to the hook before us -- Apple's
+ * UnchainJADBProc writes 2048 2048 2048 (MOVEA.L A0,A0 three times) over the JSR. */
+static void AdbHookRemove(void)
+{
+    if (gAdbHooked) {
+        if (kLMJADBProc == (UInt32)gAdbIsland) {
+            kLMJADBProc = gAdbOld;
+            DisposePtr((Ptr)gAdbIsland);
+        } else {
+            UInt16 isl[12];
+            BlockMove(gAdbIsland, isl, (Size)sizeof(isl));
+            isl[0] = 0x2048; isl[1] = 0x2048; isl[2] = 0x2048;
+            BlockMove(isl, gAdbIsland, (Size)sizeof(isl));
+            AdbIslandFlush();         /* ⚠ the case the flush exists for */
+        }
+        gAdbIsland = 0;               /* freed, or no longer ours to free */
+        gAdbHooked = 0;
+        gAdbDiag[kAdHooked] = 0;
+    } else if (gAdbIsland != 0) {
+        DisposePtr((Ptr)gAdbIsland);  /* allocated, never chained */
+        gAdbIsland = 0;
+    }
+    if (gAdbRD != 0) { DisposeRoutineDescriptor(gAdbRD); gAdbRD = 0; }
+}
+
+/* ================================================================================
+ *  adbhook2: THE FALLBACK, FROM THE EXPERT'S SLEEP AND WAKE NOTIFICATIONS.
+ * ================================================================================
+ *
+ * ★ SEEN ON THE FW800, 2026-11-16 (DBT-120, Apple's USB stack, Sleep Assistant mode A):
+ * adbhook1 alone did not save the A1015. After the wake it clicked and never moved, and
+ * BTCheck read `cursor device created 1` with no row marked ours: ADBReInit deleted the
+ * record and the hook made no replacement. Apple's ADB Manager deletes cursor devices in
+ * its own ADBProc, the far end of the JADBProc chain (boot3 ADBMgr.a: ADBReinit calls
+ * JADBProc with D0 = 0, and ADBProc's PreInit does BSR.L CrsrDevReInit), so the chain
+ * ran that wake; ours was not on it, or its code never ran.
+ *
+ * ⭐ PRIOR ART, AND THE HALF adbhook1 LEFT OUT. The OHCI companion's adbhook1 forgets
+ * its record at the WAKE MESSAGE too, "in case ADBReInit never calls JADBProc", and its
+ * task-level pump rebinds when one is missing. Run 10 needed exactly that: one of its two
+ * wakes never called the hook ("hook pre-calls = 2 (probe + ONE wake)"), and the fallback
+ * made the new record. This is that, on the notifications this driver gets from the USB
+ * Expert: kNotifySystemSleepDemand before the sleep and kNotifySystemSleepWakeUp after.
+ *
+ *  - At the DEMAND: forget. The record is still live, so its acceleration is good, and
+ *    from here every report is dropped, so none can land on a record ADBReInit frees.
+ *  - At the WAKE: forget again only if something published a record since the demand
+ *    without the hook (the hook's own post-call makes a fresh one after the deletion).
+ *  - The first dropped report after the wake asks for task level, and
+ *    BT_MouseServiceAtTask rebinds: a new record, if ADBReInit has run by then. Expected,
+ *    not measured here: Apple's ADB Manager source calls ADBReInit at wakeup, and the
+ *    companion's task-level fallback found its old record already gone every time (Run
+ *    10: kept 0). The wake hook's record below says what happened on this one.
+ *
+ * ⚠ ANY LEVEL. ProbeNotify is documented as task level, but this needs nothing from it:
+ * one pointer cleared, two low-memory reads (JADBProc, Ticks). No Toolbox. */
+void BT_MouseSleepNote(int phase)
+{
+    unsigned long jadb = (unsigned long)kLMJADBProc;
+    unsigned long now  = TickCount();
+
+    if (phase == kBtMouseNoteDemand) {
+        gAdbDiag[kAdDemandN]++;
+        gAdbDiag[kAdDemandTick]   = now;
+        gAdbDiag[kAdDemandJadb]   = jadb;
+        gAdbDiag[kAdPostAtDemand] = gAdbDiag[kAdPostN];
+        CurDevForget(kForgetAtDemand);
+    } else if (phase == kBtMouseNoteWake) {
+        gAdbDiag[kAdWakeN]++;
+        gAdbDiag[kAdWakeTick] = now;
+        gAdbDiag[kAdWakeJadb] = jadb;
+        if (gAdbDiag[kAdPostN] == gAdbDiag[kAdPostAtDemand]) CurDevForget(kForgetAtWake);
+    }
+}
+
+/* The record's address for the counter block (kWAdbDiagPtr), stamped on first use and
+ * its live words refreshed. ANY level: plain memory and two low-memory reads. The magic
+ * goes in LAST, so a reader sees a whole record or none. No sync is needed for that:
+ * gAdbDiag is volatile, so these stores stay in program order, and the only reader
+ * (BTCheck) runs on this same CPU. (A `sync` here also showed up in the level audit as
+ * an unclassified symbol, since this is reachable from the block refresh.) */
+unsigned long BT_MouseDiagRefresh(void)
+{
+    if (gAdbDiag[kAdMagic] != kAdMagicValue) {
+        gAdbDiag[kAdSelf]     = (unsigned long)&gAdbDiag[0];
+        gAdbDiag[kAdVersionW] = kAdVersion;
+        gAdbDiag[kAdEnd]      = kAdEndValue;
+        gAdbDiag[kAdMagic]    = kAdMagicValue;
+    }
+    gAdbDiag[kAdJadbNow]    = (unsigned long)kLMJADBProc;
+    gAdbDiag[kAdCurDev]     = (unsigned long)gCurDev;
+    gAdbDiag[kAdCurDevPrev] = (unsigned long)gCurDevPrev;
+    gAdbDiag[kAdTickNow]    = TickCount();
+    return (unsigned long)&gAdbDiag[0];
+}
+
+/* ⚠ TASK LEVEL ONLY, from the defer response beside BT_MediaServiceAtTask.
+ * CursorDeviceNewDevice allocates. */
+void BT_MouseServiceAtTask(void)
+{
+    CursorDevicePtr dev;
+
+    /* A record forgotten at a sleep or a wake (adbhook2) or by the hook, whose
+     * replacement was not made inside ADBReInit. Make it here; the dropped reports that
+     * brought us here asked for it. */
+    if (gCurDev == 0 && gCurDevPrev != 0) {
+        gCurWant = 0;
+        CurDevRebind(kRebindAtTask);
+        return;
+    }
+    if (!gCurWant || gCurDev != 0) {
+        if (gCurDev != 0) AdbHookInstall();   /* a no-op once chained; retries a failure */
+        return;
+    }
+    gCurWant = 0;
+
+    dev = CurDevMake(0);
+    if (dev == 0) return;
+    CurDevPublish(dev);
+    AdbHookInstall();                 /* the first record exists: keep one alive from now on */
 }
 
 /* ⚠ TASK LEVEL, from ProbeFinalize. */
 void BT_MouseFinalize(void)
 {
     CursorDevicePtr dev = gCurDev;
-    if (dev == 0) return;
+    CursorDevicePtr prev = gCurDevPrev;
+
+    /* adbhook1 FIRST: the routine descriptor points into this fragment, and no
+     * ADBReInit may call into it once the Expert unloads it. */
+    AdbHookRemove();
+
     /* ⚠ CLEAR FIRST, then dispose. An interrupt arriving between the two must see 0 and
      * drop its report, never a pointer to a device being torn down -- the same ordering
      * rule as the CSM's icon suite and for the same reason. */
     gCurDev = 0;
+    gCurDevPrev = 0;
+    __asm__ volatile ("sync" ::: "memory");
     gCurButtons = 0;
-    (void)CursorDeviceDisposeDevice(dev);
+    /* adbhook1: dispose only a record the Cursor Device Manager still holds and that is
+     * still ours. Before this fix a wake left gCurDev pointing at a record ADBReInit had
+     * already freed, and this line disposed it a second time. */
+    if (dev != 0 && CurDevListed(dev)) (void)CursorDeviceDisposeDevice(dev);
+    else if (prev != 0 && CurDevListed(prev)) (void)CursorDeviceDisposeDevice(prev);
 }

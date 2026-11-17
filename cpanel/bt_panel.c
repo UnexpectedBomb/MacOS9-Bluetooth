@@ -40,6 +40,7 @@
 #include <ToolUtils.h>    /* HiWord / LoWord, for MenuSelect's packed result     */
 #include <USB.h>          /* app-level enumeration only -- see FindBluetoothHardware */
 #include <Quickdraw.h>
+#include <Sound.h>        /* SysBeep: btwake1's wake checkbox when its file will not change */
 #include <TextEdit.h>
 #include <Balloons.h>   /* HMGetHelpMenuHandle, kHMHelpMenuID */
 #include <Windows.h>
@@ -63,7 +64,7 @@
  * check-block-words.py fails the build if this drifts from src/bt_probe.c. */
 #define kWIfaceVIDPID 155
 #define kWStkPump  65          /* BTstack run-loop iterations                    */
-#define kWEnd        794   /* ⚠ MUST track src/bt_probe.c -- CMake fails the build if not */
+#define kWEnd        837   /* ⚠ MUST track src/bt_probe.c -- CMake fails the build if not */
 
 /* ---- M6: the scan channel. ⚠⚠ THESE MUST MATCH src/bt_probe.c EXACTLY ---------
  * The panel is a separately built binary, so a disagreement here is not a compile
@@ -106,6 +107,15 @@
 #define kWBhOpenedMs    565
 #define kWBhClosed      566
 #define kWBhLive        706   /* v13.9: the maintained "a channel is open" flag */
+/* a1044pair2: the driver's two HID slots, each the cid and address of a channel that is
+ * open NOW (claimed at CONNECTION_OPENED, freed at CLOSED). kWBhLive says only that SOME
+ * channel is open, which with a mouse up says nothing about the keyboard. */
+#define kWDev0Cid       744
+#define kWDev0Hi        745
+#define kWDev0Lo        746
+#define kWDev1Cid       748
+#define kWDev1Hi        749
+#define kWDev1Lo        750
 /* ★★★ 15.9: the two words BTCheck's "PAIRING SAFETY NET" is computed from. Both zero
  * means no copy of the key exists anywhere on this Mac, so Delete is a one-way door. */
 #define kWLkStored      118
@@ -156,6 +166,8 @@
 #define kCmdDisconnect   8
 /* ⚠ Number must match src/bt_probe.c's kCmdAllowDevice. */
 #define kCmdAllowDevice  9
+/* ⚠ Number must match src/bt_probe.c's kCmdSetWake. btwake1: Arg0 = 1 allow, 0 not. */
+#define kCmdSetWake      10
 
 /* The servicer's counters. ⚠ These live in words that were SPARE, so kWEnd stays 303
  * and BTCheck v61 still finds the block. */
@@ -196,7 +208,7 @@ static Boolean  MailboxCaughtUp(void);
  * so it drifted to v8.1 (with a comment saying 'v650') across two driver versions
  * without consequence. BTCheck's copy of the same idea is live and now CMake-guarded;
  * this one is a decoy. Do not start using it without the guard. */
-#define kExpectedDriverTag 0x76483630UL   /* 'vH60' = driver v17.6 */
+#define kExpectedDriverTag 0x76493630UL   /* 'vI60' = driver v18.6 */
 
 /* ★★★★★★ THE SWITCHER'S OWN BLOCK, AND WHY THE PANEL NOW READS IT.
  *
@@ -672,6 +684,55 @@ static Boolean  gPairModeSet    = false;
  * Returns a nonzero refnum on success, 0 on any failure. ⚠ The caller REPORTS the
  * result: a flag that silently failed to appear looks identical to a switcher that
  * ignored it, and the user would restart for nothing. */
+static short PairFlagCreate(void);
+
+/* ★★★★★★ btwake1: "ALLOW BLUETOOTH DEVICES TO WAKE THIS COMPUTER" IS A FILE.
+ *
+ * `Preferences:Bluetooth Wake Allowed` exists = checked. The driver reads it in
+ * ProbeInitialize (BT_LoadWakeFlag) and arms the module's USB remote wakeup to match, so the
+ * choice survives restarts; a click also tells a running driver at once (kCmdSetWake).
+ * EXISTENCE IS THE WHOLE MESSAGE, the same idiom as Pair At Restart and Show All Devices.
+ * Absent by default: a fresh install wakes on nothing new until the box is checked.
+ * ⚠ The checkbox shows the FILE, read when the panel opens and set only after the file
+ * operation succeeds -- a box that ticks while the file did not change would claim a
+ * setting the next restart does not have. */
+static Boolean WakeMarkerPresent(void)
+{
+    FSSpec spec;
+    short  vRefNum;
+    long   dirID;
+
+    if (FindFolder(kOnSystemDisk, kPreferencesFolderType, kDontCreateFolder,
+                   &vRefNum, &dirID) != noErr) return false;
+    return FSMakeFSSpec(vRefNum, dirID, "\pBluetooth Wake Allowed", &spec) == noErr;
+}
+
+/* Create (allow) or delete (do not) the marker. Returns true when the file now matches. */
+static Boolean WakeMarkerSet(Boolean allow)
+{
+    FSSpec spec;
+    short  vRefNum, ref;
+    long   dirID;
+    OSErr  err;
+
+    if (FindFolder(kOnSystemDisk, kPreferencesFolderType, kDontCreateFolder,
+                   &vRefNum, &dirID) != noErr) return false;
+    err = FSMakeFSSpec(vRefNum, dirID, "\pBluetooth Wake Allowed", &spec);
+    if (err != noErr && err != fnfErr) return false;
+    if (!allow) {
+        if (err == fnfErr) return true;                  /* already absent */
+        if (FSpDelete(&spec) != noErr) return false;
+    } else {
+        if (err == fnfErr && FSpCreate(&spec, 'BTcp', 'BTpf', smSystemScript) != noErr)
+            return false;
+        /* ⚠ Opened and closed, as PairFlagCreate does, so "usable" is what is reported. */
+        if (FSpOpenDF(&spec, fsRdWrPerm, &ref) != noErr) return false;
+        (void)FSClose(ref);
+    }
+    (void)FlushVol(NULL, spec.vRefNum);                  /* a crash must not undo it */
+    return true;
+}
+
 static short PairFlagCreate(void)
 {
     FSSpec spec;
@@ -885,14 +946,15 @@ static const char *ModuleName(unsigned short v, unsigned short p)
 {
     if (v == 0x05AC && p == 0x1000)                return "Internal Bluetooth Card";
     if (v == 0x05AC && p >= 0x8203 && p <= 0x8207) return "Internal Bluetooth Card (HCI)";
-    /* ⚠ "BT DONGLE10" is the actual USB product string ASP read off this dongle, and
-     * 0A12:0001 is the generic CSR part -- the same personality Apple's own
-     * CSRUSBBluetoothHCIController claims as VID 2578 PID 1. We cannot read product
+    /* ⚠⚠ 0A12:0001 IS NOT ONE PRODUCT, so it gets no product name (release 18.6).
+     * It is CSR's generic HCI identity -- the same personality Apple's own
+     * CSRUSBBluetoothHCIController claims as VID 2578 PID 1 -- and two different adapters
+     * measured here both report it: the clone whose product string was "BT DONGLE10"
+     * (LMP 12), which this used to print, and the D-Link DBT-120 this release supports
+     * (Bluetooth 1.1). So every DBT-120 user read "BT DONGLE10". We cannot read product
      * STRINGS here (string descriptors need a control transfer, which is driver
-     * territory), so a known part is named from its IDs and anything else gets the
-     * generic label plus its VID:PID. */
-    if (v == 0x0A12 && p == 0x0001)                return "BT DONGLE10";
-    if (v == 0x0A12)                               return "CSR USB adapter";
+     * territory), and the VID:PID printed beside this says the rest. Any other CSR part
+     * (it used to read "CSR USB adapter") gets the same plain label, for the same reason. */
     return "USB Bluetooth adapter";
 }
 
@@ -908,7 +970,15 @@ static const char *ModuleName(unsigned short v, unsigned short p)
  * arithmetically, 354 against a 342 limit, rather than discovered on screen. 380
  * still leaves 100px of margin on a 480-line display. */
 #define kWinW 600
-#define kWinH 462
+/* ★ btwake1: 462 -> 490, for the wake option's row along the bottom (the user's choice,
+ * 2026-11-16: Tiger's wording on one line under both columns, where Tiger puts it). Nothing
+ * above the row moves: the right column's steps text now stops at kStepsB, the bottom it
+ * always had, instead of following the window. */
+#define kWinH 490
+#define kStepsB   456          /* the right column's steps text: its bottom since 462 */
+#define kWakeSepY 460          /* the rule above the row, under both columns           */
+#define kWakeT    466          /* the checkbox                                         */
+#define kWakeB    482
 
 #define kListL  12
 #define kListT  46
@@ -972,6 +1042,7 @@ static ControlHandle gRename;      /* v15.3: sits under Pair, needs a selection 
 /* v12.3: button width, measured from the widest label at build time. */
 static short gBtnW = 120;
 static ControlHandle gArrows;      /* chasing arrows, shown while a scan runs */
+static ControlHandle gWakeBox;     /* btwake1: "Allow Bluetooth devices to wake this computer" */
 static short         gSelRow = -1;
 
 static void PStr(Str255 d, const char *s)
@@ -2120,6 +2191,32 @@ static Boolean HidChannelOpen(void)
     return false;
 }
 
+/* ★★★★★★ a1044pair2 -- IS *THIS* DEVICE'S CHANNEL OPEN? kWBhLive CANNOT SAY.
+ *
+ * ⚠⚠ MEASURED 2026-11-16 (driver a1044pair1, BTCheck dfdf8b5c). The A1015 paired and
+ * worked; then the A1016 paired, its link came up and was encrypted, and its HID channel
+ * never opened -- light blinking, nothing typed, no battery. This panel said "Connected"
+ * for it, and greyed Pair as "working -- leave it alone". kWBhLive was 1, but it was the
+ * MOUSE's channel: the flag says a channel is open somewhere, and both callers asked it
+ * about one particular row. The driver's own connect guard had the same flaw and is fixed
+ * in the same build.
+ *
+ * ⇒ Read the driver's two HID slots (744..751): each holds the cid and address of a channel
+ * open now. A row is open only if a slot carries its address.
+ * ⚠ A driver older than 15.0 publishes no slots, so both cids read 0 there; fall back to
+ * the one flag such a driver has rather than call every device not ready. */
+static Boolean HidChannelOpenFor(unsigned long hi, unsigned long lo)
+{
+    if (gBlock == NULL) return false;
+    if (gBlock[kWDev0Cid] != 0 && gBlock[kWDev0Hi] == hi && gBlock[kWDev0Lo] == lo)
+        return true;
+    if (gBlock[kWDev1Cid] != 0 && gBlock[kWDev1Hi] == hi && gBlock[kWDev1Lo] == lo)
+        return true;
+    if (gBlock[kWDev0Cid] == 0 && gBlock[kWDev1Cid] == 0 && DriverVerBCD() < 1500)
+        return HidChannelOpen();
+    return false;
+}
+
 /* ★★★★★★ 15.9 -- IS DELETING THIS BOND A ONE-WAY DOOR?
  *
  * ⚠⚠ THIS EXISTS BECAUSE THE INFORMATION WAS ALREADY THERE AND THE PANEL DID NOT READ IT.
@@ -2390,7 +2487,10 @@ static const char *CellText(short row, short col, char *scratch)
                      * no HID channel and never will be, so "Connected" is the honest
                      * answer there; the distinction is only meaningful for an INPUT
                      * device, which is why it is gated on the class of device. */
-                    if (IsInputDevice(gRow[row].cod) && !HidChannelOpen())
+                    /* a1044pair2: THIS row's channel, not any channel -- with the mouse
+                     * up, the global flag called a keyboard with no channel Connected. */
+                    if (IsInputDevice(gRow[row].cod)
+                        && !HidChannelOpenFor(gRow[row].addrHi, gRow[row].addrLo))
                         return "Linked, not ready";
                     return gRow[row].paired ? "Connected" : "Connected, no key";
                 }
@@ -3304,10 +3404,35 @@ static void ActNote(char tag, unsigned long before, unsigned long after)
 static short   gStatRef   = 0;         /* open file refnum, 0 = not open        */
 static short   gStatVRef  = 0;         /* the volume, for FlushVol              */
 static Boolean gStatDead  = false;     /* an error occurred; stop trying        */
-static unsigned long gStatLast = 0;    /* TickCount of the last write           */
+static unsigned long gStatLast = 0;    /* TickCount of the last CHECK (idlefix1) */
 static unsigned long gPollCount = 0;   /* task-level pulse: OUR liveness        */
 
 #define kStatEveryTicks 900            /* ~15 s */
+
+/* ★★ idlefix1: WRITE ONLY WHEN SOMETHING CHANGED -- this file held off idle sleep.
+ *
+ * MEASURED on the FW800, 2026-11-15 (Sleep Assistant uwake17A's activity hook, log
+ * e3883cf6): with this panel open and the Mac left alone, StatusWrite pushed Mac OS's
+ * idle clock 95 times, 15-45 s apart (route `StatusWrite <- main`, by DelaySystemIdle
+ * from `_Write`): OS 9's _Write is a System patch that reports activity on every write,
+ * and each push hands the idle timer 10 s back. A write every 15 s therefore puts idle
+ * sleep about half an hour after the last input instead of ten minutes; the user's
+ * first DBT-120 wait saw no sleep at all in 20+ minutes. Same disease as the strip's
+ * 2.6 (idlefix1 there too): a timer-driven file access that changes nothing.
+ *
+ * So every 15 s this now compares what it WOULD write, minus the counters that run
+ * whether or not anything happens (ticks, polls, intcomp, pumps, timer), with what it
+ * last wrote, and writes only on a difference -- or, so a frozen idle machine still
+ * shows roughly when it was last alive, after kStatRefreshTicks unchanged. A refresh
+ * every 30 minutes costs idle sleep at most one 10-s push, and usually none. Forced
+ * writes (an action worth flushing now, the final line at close) are unchanged. The
+ * appended `wr written/skipped` counts are this build's own witness. */
+#define kStatRefreshTicks 108000UL     /* 30 min */
+#define kStatSigN 10
+static unsigned long gStatWritten = 0; /* TickCount of the last write            */
+static unsigned long gStatSig[kStatSigN];
+static Boolean       gStatHaveSig = false;
+static unsigned long gStatWrites = 0, gStatSkips = 0;
 
 static void StatusOpen(void)
 {
@@ -3349,6 +3474,37 @@ static void StatusWrite(Boolean force)
     if (!force && (now - gStatLast) < kStatEveryTicks) return;
     gStatLast = now;
 
+    /* idlefix1: the state this line reports, without the free-running counters. The
+     * action log and the timeline only ever append (both stop when full), so their
+     * lengths are their change. */
+    {
+        unsigned long sig[kStatSigN];
+        short k = 0, i;
+        Boolean same;
+        sig[k++] = (gBlock != NULL);
+        if (gBlock != NULL) {
+            sig[k++] = (unsigned long)gBlock[kWScanState];
+            sig[k++] = (unsigned long)gBlock[kWScanCount];
+            sig[k++] = (unsigned long)gBlock[kWKeyCount];
+            sig[k++] = (unsigned long)gBlock[kWInit];
+            sig[k++] = (unsigned long)gBlock[kWCmdSeq];
+            sig[k++] = (unsigned long)gBlock[kWCmdAck];
+        }
+        sig[k++] = (unsigned long)gActLen;
+        sig[k++] = (unsigned long)gTLen;
+        while (k < kStatSigN) sig[k++] = 0;
+        same = gStatHaveSig;
+        for (i = 0; i < kStatSigN && same; i++) if (sig[i] != gStatSig[i]) same = false;
+        if (!force && same && (now - gStatWritten) < kStatRefreshTicks) {
+            gStatSkips++;
+            return;
+        }
+        for (i = 0; i < kStatSigN; i++) gStatSig[i] = sig[i];
+        gStatHaveSig = true;
+    }
+    gStatWritten = now;
+    gStatWrites++;
+
     if (gStatRef == 0) { StatusOpen(); if (gStatRef == 0) return; }
 
     line[0] = 0;
@@ -3363,10 +3519,14 @@ static void StatusWrite(Boolean force)
      *
      * ⇒ CMake now greps this file for "BTPanel <PANEL_VER>" and fails the build if it
      * disagrees, the same shape as the driver's three-way version guard. */
-    PStrCat(line, "BTPanel 19.2  ticks ");
+    PStrCat(line, "BTPanel 19.8  ticks ");
     PStrCatNum(line, (long)now);
     PStrCat(line, "  polls ");
     PStrCatNum(line, (long)gPollCount);
+    PStrCat(line, "  wr ");                   /* idlefix1: written / skipped (unchanged) */
+    PStrCatNum(line, (long)gStatWrites);
+    PStrCat(line, "/");
+    PStrCatNum(line, (long)gStatSkips);
 
     if (gBlock != NULL) {
         /* ★ The driver's own pulse, read from the shared block. If these stand still
@@ -3592,6 +3752,22 @@ static void MakeControls(void)
     gArrows = NewControl(gWin, &r, t, false, 0, 0, 1,
                          kControlChasingArrowsProc, 0);
 
+    /* ★★★★★★ btwake1: "ALLOW BLUETOOTH DEVICES TO WAKE THIS COMPUTER", Tiger's wording on
+     * one line under both columns, where Tiger's Bluetooth tab puts it (the user's choice,
+     * 2026-11-16, over the right column and the Bluetooth box).
+     * ⚠ Sized to its title in the SYSTEM font, as the radios are, so the hit area is the
+     * box and the words rather than the whole row. Its value is the Preferences marker,
+     * read now; see WakeMarkerSet. */
+    { short w;
+      TextFont(systemFont); TextSize(12);
+      PStr(t, "Allow Bluetooth devices to wake this computer");
+      w = (short)(StringWidth(t) + 22);                 /* 16 glyph + 6 gap/pad */
+      if (w > (short)(kBtnR - kListL)) w = (short)(kBtnR - kListL);
+      SetRect(&r, kListL, kWakeT, (short)(kListL + w), kWakeB);
+      gWakeBox = NewControl(gWin, &r, t, true, WakeMarkerPresent() ? 1 : 0, 0, 1,
+                            checkBoxProc, 0);
+      TextFont(applFont); TextSize(9); }
+
     /* ⚠ The three selection-dependent buttons start DISABLED, because nothing is
      * selected. A button that looks live and does nothing when clicked teaches the
      * user to distrust the whole panel. */
@@ -3626,7 +3802,14 @@ static void MakeControls(void)
  * of bug [[feedback_guards_must_not_latch]] describes. */
 static Boolean ComponentsOK(void)
 {
-    return (Boolean)(gHasHardware && gExtPresent && gBlock != NULL);
+    /* ⭐ Path A: gate on the 'BTP1' STATUS BLOCK, which is the single strongest proof the driver is loaded and its
+     * mailbox is being serviced -- nothing else publishes it. On the USB-Expert path (A1044 switcher, or a DBT-120
+     * dongle) the block is present alongside the switcher FILE and USB-Manager-detected hardware. On Path A the UIM
+     * owns the controller PRIVATELY, so the switcher file is absent AND the USB Manager never sees the controller
+     * (gHasHardware is false too) -- yet the block is live and the buttons work through the mailbox. Requiring the
+     * file or gHasHardware greyed the controls over a working Path-A driver (and the user could not Scan or turn the
+     * radio on). The block alone enables the controls on EVERY path and still greys correctly when no driver is up. */
+    return (Boolean)(gBlock != NULL);
 }
 
 static void SyncButtons(void)
@@ -3765,7 +3948,13 @@ static void SyncButtons(void)
                 if (gBlock[kWLiveA0Hi + k * 2]     == gRow[gSelRow].addrHi
                  && gBlock[kWLiveA0Hi + k * 2 + 1] == gRow[gSelRow].addrLo)
                     { live = true; break; }
-            if (live && gRow[gSelRow].paired && HidChannelOpen())
+            /* a1044pair2: per device. With the global flag, a paired keyboard whose own
+             * channel never opened had Pair greyed because the MOUSE was working. "Working"
+             * is judged the way the status column judges it: an input device by its own
+             * HID channel, anything else (a phone) by being linked and paired. */
+            if (live && gRow[gSelRow].paired
+                && (!IsInputDevice(gRow[gSelRow].cod)
+                    || HidChannelOpenFor(gRow[gSelRow].addrHi, gRow[gSelRow].addrLo)))
                 pairable = false;                       /* working -- leave it alone */
         }
         HiliteControl(gConfigure, pairable ? 0 : 255);
@@ -4690,7 +4879,9 @@ static void DrawPairSteps(void)
     Str255    t;
     short     i, y = 278, widest = 0, pitch = 13;
 
-    SetRect(&box, kBtnL, 268, kBtnR, kWinH - 6);
+    /* ⚠ btwake1: kStepsB, not kWinH - 6 -- the window grew for the wake row and this text
+     * must not grow into it. 456 is the bottom it had at kWinH 462. */
+    SetRect(&box, kBtnL, 268, kBtnR, kStepsB);
     /* ⚠ Erased first: this block is static text with no control behind it, and QuickDraw
      * does not clean up after text that is simply not redrawn. */
     ErasePlatinum(&box);
@@ -4865,6 +5056,15 @@ static void DrawFrame(void)
     DrawDeviceInfo();
     DrawDescription();
     DrawPairSteps();
+
+    /* ★ btwake1: the rule above the wake option's row, under both columns -- the theme's
+     * own separator, with FrameGroup's fallback if the Appearance Manager will not draw. */
+    { Rect sr;
+      SetRect(&sr, kListL, kWakeSepY, kBtnR, (short)(kWakeSepY + 2));
+      if (DrawThemeSeparator(&sr, kThemeStateActive) != noErr) {
+          gThemeOK = false;
+          MoveTo(kListL, kWakeSepY); LineTo(kBtnR, kWakeSepY);
+      } }
 }
 
 /* ---- menus ---------------------------------------------------------------- *
@@ -5020,16 +5220,34 @@ static void SetUpMenus(void)
 static const char *kHelpText =
 "WHAT THIS CONTROL PANEL DOES\r"
 "\r"
-"It lets Mac OS 9 use a Bluetooth keyboard or mouse directly, without Mac OS X. "
-"Pairings live in the Bluetooth module itself, so a paired keyboard keeps working "
-"from the moment the machine starts.\r"
+"It lets Mac OS 9 use a Bluetooth keyboard or mouse directly, without Mac OS X. It "
+"has been tested with the Apple Wireless Keyboard and the Apple Wireless Mouse.\r"
+"\r"
+"\r"
+"WHICH BLUETOOTH ADAPTERS WORK\r"
+"\r"
+"Two, one at a time:\r"
+"\r"
+"The Mac's internal Apple Bluetooth module (A1044). Install both extensions, USB "
+"Bluetooth Support and USBBluetoothSwitch. Pairings are also kept in the module "
+"itself, so a paired keyboard works from the moment the Mac starts, even at the "
+"startup disk picker.\r"
+"\r"
+"A D-Link DBT-120 USB adapter. Install USB Bluetooth Support only: USBBluetoothSwitch "
+"is for the internal module. A paired keyboard works once Mac OS is running.\r"
+"\r"
+"On a Mac that has the internal module, use a DBT-120 only with USBBluetoothSwitch "
+"taken out of the Extensions folder, so the internal module stays with Mac OS. "
+"Pairings belong to the adapter they were made with, so pair your devices again "
+"after changing adapters.\r"
 "\r"
 "\r"
 "PAIRING A DEVICE\r"
 "\r"
 "1. Put the device into pairing mode. On an Apple Wireless Keyboard or Mouse, "
 "switch it OFF and then ON while it is not paired with anything; its light "
-"blinks.\r"
+"blinks. A device still paired with another adapter or Mac will not blink: take its "
+"batteries out for a while (a quick pull may not be enough), then switch it on.\r"
 "2. Click Scan For Devices. The device appears with the status Available.\r"
 "3. Select it and click Pair. Type 0000 and Return on the DEVICE when asked.\r"
 "\r"
@@ -5091,10 +5309,23 @@ static const char *kHelpText =
 "Pair is greyed out on a device that is Connected, because re-pairing would renegotiate something that is already working. On every other status it is available, including Linked, not ready and Connected, no key, where trying again is the fix. Pairing a device you have Disconnected is allowed and releases the disconnection: asking to pair something is a clear statement that you want it back.\r"
 "\r"
 "\r"
+"ALLOW BLUETOOTH DEVICES TO WAKE THIS COMPUTER\r"
+"\r"
+"With this checked, a paired Bluetooth keyboard or mouse can wake the Mac from sleep. "
+"Unchecked, Bluetooth devices cannot wake it; a wired keyboard and the power button still can. "
+"It starts unchecked. A change takes effect at once and is kept when you restart.\r"
+"\r"
+"It needs a Mac whose USB ports can wake it from sleep, as a wired USB keyboard does. On "
+"the Power Mac G4 MDD FW800, where it was tested, that requires an additional extension "
+"called Sleep Assistant. It was tested with the internal module; with a DBT-120 it is "
+"untested.\r"
+"\r"
+"\r"
 "WHAT THE CONFIGURATION DETAILS MEAN\r"
 "\r"
 "Module detected -- the Bluetooth hardware this Mac has. On a Power Mac G4 with the "
-"factory option this reads Internal Bluetooth Card.\r"
+"factory option this reads Internal Bluetooth Card. A DBT-120 reads USB Bluetooth "
+"adapter.\r"
 "\r"
 "Extension detected -- the version of the Bluetooth software installed in your System "
 "Folder. This is read from the file, so it answers even when the software is not "
@@ -5116,10 +5347,12 @@ static const char *kHelpText =
 "not take it. The number in brackets is the error. Check the extension is installed "
 "and expanded.\r"
 "   card not seen by the switcher -- the hardware was not found.\r"
-"   Inactive (A1044 module not detected) -- normal on a machine with no internal "
-"Apple Bluetooth module, such as one using a USB dongle. The switcher only takes the "
-"INTERNAL card out of proxy mode; nothing is wrong and nothing needs installing.\r"
-"   switcher extension not installed -- one of the two extensions is missing.\r"
+"   Inactive (A1044 module not detected) -- normal when a DBT-120 is in use. The "
+"switcher only takes the INTERNAL module out of the mode it starts up in, and a "
+"DBT-120 needs none of that; nothing is wrong and nothing needs installing.\r"
+"   switcher extension not installed -- the switcher did not run at start-up: "
+"USBBluetoothSwitch is not in the Extensions folder, or there is no internal module "
+"for it to find. The internal module needs it; a DBT-120 does not.\r"
 "\r"
 "Scan -- what the last Scan For Devices did, and any error it met.\r"
 "\r"
@@ -5129,8 +5362,9 @@ static const char *kHelpText =
 "If the panel says Boot protocol only; report protocol inactive, this is what it "
 "means.\r"
 "\r"
-"A Bluetooth keyboard can talk to a Mac in two ways. The simple way carries the "
-"ordinary keys and nothing else, and the Bluetooth module can do it entirely on its "
+"This applies to the internal module only. A Bluetooth keyboard can talk to a Mac in "
+"two ways. The simple way carries the "
+"ordinary keys and nothing else, and the internal module can do it entirely on its "
 "own, without this software. The fuller way carries everything -- including the volume, "
 "mute and eject keys -- and needs this software running.\r"
 "\r"
@@ -5141,6 +5375,9 @@ static const char *kHelpText =
 "\r"
 "\r"
 "FILE MENU\r"
+"\r"
+"The first two apply to the internal module only; this software always drives a "
+"DBT-120.\r"
 "\r"
 "Turn On Pairing at Restart -- forces this software to claim the Bluetooth module at "
 "the next start-up. You do not normally need it: the module is claimed automatically "
@@ -5159,10 +5396,14 @@ static const char *kHelpText =
 "\r"
 "IF SOMETHING IS NOT WORKING\r"
 "\r"
-"A keyboard or mouse that pairs and then does nothing: look at the Card switch line "
-"in Configuration Details. If it does not say switched at start-up, this software is "
-"not driving the module, and that is the problem rather than the device. Otherwise "
-"switch the device off and on once.\r"
+"A keyboard or mouse that pairs and then does nothing: look at Driver active in "
+"Configuration Details. If it does not say Yes, this software is not driving the "
+"adapter, and that is the problem rather than the device; with the internal module, "
+"the Card switch line says why. Otherwise switch the device off and on once.\r"
+"\r"
+"Devices that keep flipping between Connected and Paired, disconnected after a DBT-120 "
+"was added to a Mac with the internal module: take USBBluetoothSwitch out of the "
+"Extensions folder and restart. The two adapters cannot be used at the same time.\r"
 "\r"
 "A device that will not reconnect: press a key or move it. These devices sleep to "
 "save their batteries and only reconnect when used.\r"
@@ -5935,10 +6176,17 @@ static void DrawAboutContent(WindowPtr w, ControlHandle okBtn)
 {
     Rect        box, ir, tr;
     Str255      t;
+    /* ★ RELEASE 18.6 (user, 2026-11-16): NAME BOTH ADAPTERS. The text used to say only
+     * that pairings live "in the Bluetooth module itself, so a paired keyboard works from
+     * start-up" -- true of the internal A1044, false of a DBT-120, which is now supported.
+     * ⚠ The well holds about eight lines of Geneva 10 above the two credit lines; this is
+     * six. Check it in QEMU after any edit (reference_qemu_os9_ui_screenshots). */
     const char *desc =
         "Bluetooth support for Mac OS 9. Pair an Apple Wireless Keyboard or Mouse "
-        "and use it directly, with no Mac OS X required. Pairings are stored in the "
-        "Bluetooth module itself, so a paired keyboard works from start-up.";
+        "and use it directly, with no Mac OS X required. Works with the Mac's internal "
+        "Apple Bluetooth module (A1044) or a D-Link DBT-120 USB adapter, one at a time. "
+        "With the internal module, pairings are also kept in the module itself, so a "
+        "paired keyboard works from start-up.";
 
     SetPort(w);
     ErasePlatinum(&w->portRect);
@@ -5969,7 +6217,7 @@ static void DrawAboutContent(WindowPtr w, ControlHandle okBtn)
          * never written a second time. Rewriting this function once already deleted
          * that string and the stamper refused to write -- the guard working. Two copies
          * of a version number is a lie waiting for the next release. */
-        static const char *kPanelVer = "Control panel 19.2 - device scanning";
+        static const char *kPanelVer = "Control panel 19.8 - device scanning";
         char v[24]; short i = 0;
         const char *q = kPanelVer + 14;          /* past "Control panel " */
         v[i++] = 'V'; v[i++] = 'e'; v[i++] = 'r'; v[i++] = 's';
@@ -6742,6 +6990,22 @@ int main(void)
                              * was, matching the buttons rather than the click. */
                             DrawRadioLogo();
                             DrawPanes();
+                        }
+                        /* ★★★★ btwake1: THE WAKE OPTION. The standard checkbox does not
+                         * toggle itself; the click decides, the FILE is changed first,
+                         * and the box shows the new value only if that worked -- so it
+                         * never claims a setting the next restart will not have. Then a
+                         * running driver is told at once; one that is not running reads
+                         * the file when it loads. */
+                        else if (c == gWakeBox) {
+                            Boolean want = (GetControlValue(gWakeBox) == 0);
+                            if (WakeMarkerSet(want)) {
+                                SetControlValue(gWakeBox, want ? 1 : 0);
+                                if (gBlock != NULL)
+                                    (void)MailboxSend(kCmdSetWake, want ? 1UL : 0UL, 0);
+                            } else {
+                                SysBeep(1);
+                            }
                         }
                         /* ★★ THE FIRST BUTTON THAT DOES SOMETHING REAL. Everything
                          * else on this panel is still scaffolding. */

@@ -50,6 +50,11 @@ void BT_BatteryFlushIfDirty(void);
  * File Manager itself. */
 void BT_LoadShowAllFlag(void);
 
+/* ⚠ TASK LEVEL ONLY, from ProbeInitialize. btwake1: sets gWakeAllowed from the existence of
+ * `Preferences:Bluetooth Wake Allowed` (the panel's wake checkbox) and asks the pump to
+ * apply it to the module once ConfigDone has run. */
+void BT_LoadWakeFlag(void);
+
 /* ★ Post any owed low-battery warning. TASK LEVEL, from the defer response beside
  * BT_BatteryFlushIfDirty. The threshold is latched at interrupt level in
  * BT_BatteryNote with hysteresis, so this only ever has work when a level has newly

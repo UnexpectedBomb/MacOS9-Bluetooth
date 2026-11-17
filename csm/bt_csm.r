@@ -47,12 +47,25 @@ type 'vers' {
  *
  * ⚠ 1.0 said "no battery level", because at the time the level was believed
  * unobtainable. It is obtainable through our own HCI stack -- see the header of
- * bt_csm.c and docs/CSM-BATTERY-FEASIBILITY.md -- and 1.1 is that gauge. */
+ * bt_csm.c and docs/CSM-BATTERY-FEASIBILITY.md -- and 1.1 is that gauge.
+ *
+ * ★ RELEASE 18.6 (user, 2026-11-16): PLAIN VERSIONS, as for every file of the stack.
+ * vers(1) is the number alone in both strings; vers(2) names the release. 2.7 is 2.6
+ * idlefix1's code (the test build the sleep runs used) under a release number, since "2.6"
+ * alone was an earlier build without the idle fix. A strip module appears in neither
+ * Extensions Manager nor ASP, so Get Info is where this is read. */
 resource 'vers' (1) {
-    0x02, 0x30, 0x80, 0x00,
+    0x02, 0x70, 0x80, 0x00,
     0,
-    "2.5",
-    "2.5 - Bluetooth device battery level; user-renamed devices"
+    "2.7",
+    "2.7"
+};
+
+resource 'vers' (2) {
+    0x02, 0x70, 0x80, 0x00,
+    0,
+    "2.7",
+    "OS 9 Bluetooth 18.6"
 };
 
 /* ---- Finder bundle ---------------------------------------------------------- *
@@ -88,8 +101,11 @@ resource 'vers' (1) {
  * for a NUMBER, and if these two drift the module silently gets no icon and falls back
  * to a text label, which looks like a design choice rather than a broken reference. */
 #include "icons/bt_csm_cell_icon.r"
+/* ⚠ The signature resource's string is a version stamp too (it read 2.6 through 2.6
+ * idlefix1). The panel's is moved by bump-version.py; this one is moved by hand with
+ * CSM_VER, and the CMake guard below the vers check proves it. */
 data 'BTcs' (0) {
-    "2.5, github.com/UnexpectedBomb"
+    "2.7, github.com/UnexpectedBomb"
 };
 
 /* FREF: file type 'sdev', local icon ID 0, empty name. */

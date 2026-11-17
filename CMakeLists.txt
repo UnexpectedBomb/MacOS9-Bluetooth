@@ -103,7 +103,7 @@ endif()
 # alone. Bumping DRIVER_VER is now the whole job for the filename; the 'vers' resource
 # and the block build tag in src/bt_probe.c still need to move with it, and there is a
 # check below that fails the build if they disagree.
-set(DRIVER_VER "17.6")
+set(DRIVER_VER "18.6")
 
 add_custom_command(OUTPUT USBBluetoothSupport-v${DRIVER_VER}.ndrv
     COMMAND ${REZ} ${REZ_FLAGS} ${CMAKE_CURRENT_SOURCE_DIR}/bt_probe.r
@@ -318,14 +318,22 @@ endif()
 # ⚠ The fact whoever finds this extension needs is whether it takes the keyboard away at
 # startup. 1.3 DOES claim the card -- so the string must also say what protects them,
 # which is the one-boot fallback when the driver does not come up.
+#
+# ★ REPOINTED A THIRD TIME, for release 18.6 (user, 2026-11-16): PLAIN VERSIONS, as
+# approved for AirPort 2.0. Get Info shows the number alone, and vers(2) names the release
+# (OS 9 Bluetooth <release>). The explanation above did not disappear: it moved to the
+# panel's Help ("Card switch") and the README. So the guard now proves the two things that
+# can drift -- both vers(1) strings are exactly SWITCH_VER, and a vers(2) names the release.
 file(READ ${CMAKE_CURRENT_SOURCE_DIR}/bt_switch.r _sw_rez)
-if(NOT _sw_rez MATCHES "Bluetooth Switch ${SWITCH_VER} - claims the A1044 at boot")
+if(NOT _sw_rez MATCHES "\"${SWITCH_VER}\",[ \t\r\n]*\"${SWITCH_VER}\"[ \t\r\n]*}")
     message(FATAL_ERROR
-        "bt_switch.r's LONG vers string must read \"Bluetooth Switch ${SWITCH_VER} - "
-        "idle at boot; ...\". Get Info shows the LONG string, and the one thing anyone "
-        "finding this extension needs to know is whether it takes the keyboard away at "
-        "startup. As of 1.2 it does not -- if that ever changes again, say so there and "
-        "change this check deliberately.")
+        "bt_switch.r's vers(1) must carry \"${SWITCH_VER}\" as BOTH its short and its long "
+        "string (release 18.6's plain style: Get Info shows the long one).")
+endif()
+if(NOT _sw_rez MATCHES "resource 'vers' \\(2\\)[^}]*\"OS 9 Bluetooth [0-9]+\\.[0-9]\"")
+    message(FATAL_ERROR
+        "bt_switch.r needs a vers(2) whose long string names the release, "
+        "\"OS 9 Bluetooth <release>\" -- the Package column and the line under the name.")
 endif()
 
 # ⚠⚠ THE THREE COPIES OF THE DRIVER VERSION MUST AGREE, AND THIS PROVES IT AT

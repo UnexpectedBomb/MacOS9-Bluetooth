@@ -433,6 +433,21 @@ KNOWN_SAFE = {
     'btstack_run_loop_set_timer': 'timeout arithmetic only; no allocation',
     'btstack_run_loop_set_timer_handler': 'stores a function pointer in the caller-owned '
                                           'timer source; no allocation',
+    # ⚠ CLASSIFIED a1044pair1 (2026-11-16), prompted by the hook flagging 57 -> 59 when the
+    # deferred Pair (BT_PairDeferArm) made them reachable from hci_event_handler. Read, not
+    # assumed: btstack_run_loop_add_timer -> the_run_loop->add_timer = os9_add_timer
+    # (src/btstack_run_loop_os9.c:142) -> btstack_run_loop_base_add_timer
+    # (vendor/btstack/src/btstack_run_loop.c:93), a sorted walk-and-link into the STATIC
+    # btstack_run_loop_base_timers list; remove -> os9_remove_timer ->
+    # btstack_run_loop_base_remove_timer (:89) -> btstack_linked_list_remove
+    # (btstack_linked_list.c:138), an unlink. No allocation, no blocking, no File Manager.
+    # Same calls the battery scheduler, the reconnect and the half-open watchdog already
+    # make from BTstack's own event callbacks at this level (function pointers this audit
+    # cannot follow, which is why these two were never reached before). ⚠ add ASSERTS on a
+    # timer already in the list: every caller must remove first (BT_PairDeferArm does).
+    'btstack_run_loop_add_timer': 'sorted insert into the static timer list; no allocation',
+    'btstack_run_loop_remove_timer': 'linked-list unlink from the static timer list; '
+                                     'no allocation',
     'BT_LinkKeyCount': 'pure loop over the static gKeys[] array',
     'BT_LinkKeyGetByIndex': 'memcpy out of the static gKeys[] array; no allocation',
     'hid_host_connect': 'static-pool slot + l2cap/sdp enqueue; no allocator because '
@@ -605,6 +620,13 @@ KNOWN_SAFE = {
     #   times. Chosen over maintaining our own shadow of the connection list precisely
     #   because the shadow -- one 'most recent peer' global -- is what produced the bug.
     'hci_connection_for_bd_addr_and_type': 'read-only list walk; no alloc, no mutation',
+    #   hci_connection_for_handle (hci.c:406), btwake1: the same READ-ONLY WALK of
+    #   hci_stack->connections -- iterator init, one con_handle compare per node, return
+    #   the node or NULL. Read before classifying: no allocation, no blocking, no trap,
+    #   mutates nothing. Reached from BT_DeliverPacket's wake recorder (BT_WakeRecPacket),
+    #   the USB completion level every other transport hook already runs at, at most
+    #   once per sleep (the recorder disarms after the first packet).
+    'hci_connection_for_handle': 'read-only list walk; no alloc, no mutation',
     #   ---- v13.0, the remote-name trio. All three read at interrupt level, from the
     #   same hci_event_handler every other event accessor in this driver runs in.
     #   gap_remote_name_request (hci.c): one state test, a 6-byte memcpy into

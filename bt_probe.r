@@ -40,11 +40,25 @@ resource 'cfrg' (0) {
  * short string were being bumped, the long string was not, and the only place the
  * user ever looks was therefore the only place still reading 4.1.
  *
- * scripts/bump-version.py now REFUSES to bump unless this string starts
- * "Bluetooth Support <ver> - ", so the convention is enforced rather than
- * remembered. Do not reword that prefix without updating the script. */
+ * ★ RELEASE 18.6 (user, 2026-11-16): PLAIN VERSIONS, the shape approved for AirPort
+ * 2.0. vers(1) carries the number alone in BOTH strings, so Get Info's "Version:" line
+ * reads "18.6" and nothing else; vers(2)'s long string names the release every file of
+ * the stack came from, OS 9 Bluetooth <release> -- Get Info shows it under the file name
+ * and Extensions Manager / ASP in their Package column. No description, no changelog,
+ * no build tag: test builds say what they are in their FILENAMES and log banners.
+ *
+ * scripts/bump-version.py REFUSES to bump unless vers(1) reads "<ver>" in both strings
+ * and the numeric pair appears in both resources, so the convention is enforced rather
+ * than remembered (it used to enforce "Bluetooth Support <ver> - "). Its --release
+ * option moves "OS 9 Bluetooth <release>" in all five .r files of the stack at once. */
 resource 'vers' (1) {
-    0x17, 0x60, finalStage, 0x00, verUS,
-    "17.6",
-    "Bluetooth Support 17.6 - native Bluetooth for Mac OS 9"
+    0x18, 0x60, finalStage, 0x00, verUS,
+    "18.6",
+    "18.6"
+};
+
+resource 'vers' (2) {
+    0x18, 0x60, finalStage, 0x00, verUS,
+    "18.6",
+    "OS 9 Bluetooth 18.6"
 };

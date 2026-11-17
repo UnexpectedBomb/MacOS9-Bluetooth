@@ -31,6 +31,18 @@ USAGE
     scripts/bump-version.py --driver 5.5        # dry run, shows every edit
     scripts/bump-version.py --driver 5.5 --apply
     scripts/bump-version.py --panel 3.1 --btcheck 62 --apply
+    scripts/bump-version.py --release 18.7      # the "OS 9 Bluetooth <release>" vers(2)
+                                                # string, in all five .r files at once
+
+⚠ VERIFY MODE, which costs nothing: pass the CURRENT versions (e.g. --driver 18.6
+--panel 19.8 --btcheck 99.110 --release 18.6) without --apply. Every rule then looks for
+the version that is already there, so a stamp that is missing or doubled shows as a
+MISMATCH -- a full audit of every version site without changing a byte.
+
+★ RELEASE 18.6 (user, 2026-11-16) made the 'vers' strings PLAIN: vers(1) is the number
+alone in both its strings, vers(2)'s long string is "OS 9 Bluetooth <release>". The
+rules below enforce that shape. The strip (csm/) and the switcher are still bumped by
+hand -- each has a CMake guard tying its 'vers' to its CSM_VER / SWITCH_VER.
 
 ⚠ Version format: MAJOR.MINOR with a SINGLE-DIGIT MINOR ("5.4"). The counter-block build
 tag is four ASCII bytes 'v' major minor '0', so 4.10 is impossible and 4.9 must go to
@@ -126,9 +138,10 @@ def edits_for_driver(old, new):
     return [
         ('CMakeLists.txt', f'set(DRIVER_VER "{old}")', f'set(DRIVER_VER "{new}")', 1),
         # ⚠ BCD, and 10 is where decimal and BCD stop coinciding -- see bcd().
+        # ⚠ TWO copies since release 18.6: vers(1) and vers(2) carry the same numeric pair.
         ('bt_probe.r', f'0x{bcd(om):02X}, 0x{on}0, finalStage',
-                       f'0x{bcd(nm):02X}, 0x{nn}0, finalStage', 1),
-        ('bt_probe.r', f'"{old}",', f'"{new}",', 1),
+                       f'0x{bcd(nm):02X}, 0x{nn}0, finalStage', 2),
+        ('bt_probe.r', f'"{old}",', f'"{new}",', 2),
         # ⚠⚠ THE LONG STRING IS THE ONE GET INFO SHOWS, and it was the one stamp this
         # script did not cover. The Finder's "Version:" line displays the LONG version
         # string; the short string above is for list views and the Installer. So from
@@ -136,8 +149,10 @@ def edits_for_driver(old, new):
         # while the long string stayed at 4.1 -- and the single place the user actually
         # reads the version was the single place still wrong. The panel already had
         # this rule; the driver did not, which is the whole reason it drifted.
-        ('bt_probe.r', f'"Bluetooth Support {old} - ',
-                       f'"Bluetooth Support {new} - ', 1),
+        # ★ RELEASE 18.6 (user, 2026-11-16): the long string is now the PLAIN number, as
+        # approved for AirPort 2.0 -- it used to be "Bluetooth Support <ver> - <words>".
+        # Anchored on the closing brace so it can only be vers(1)'s LONG string.
+        ('bt_probe.r', f'"{old}"\n}};', f'"{new}"\n}};', 1),
         # ⚠ Three copies: one per descriptor rule, and the rule-1 copy is inside an
         # #if so a naive single replace would leave it stale and un-compiled-but-wrong.
         # ⚠⚠ THIS SITE SPELLS THE MAJOR AS A BARE DECIMAL LITERAL while bt_probe.r
@@ -175,13 +190,10 @@ def edits_for_driver(old, new):
         # comment naming a build tag is a version stamp.
         ('cpanel/bt_panel.c', f"'v{majchar(om)}{on}0'", f"'v{majchar(nm)}{nn}0'", 1),
         ('bt-check/bt_check.c', f"'v{majchar(om)}{on}0'", f"'v{majchar(nm)}{nn}0'", 1),
-        # ⚠ BTCheck's Get Info string names the DRIVER version it expects, so a driver
-        # bump has to move it -- nothing covered it before, and it was one bump away
-        # from telling the user BTCheck expected a driver version that no longer
-        # existed. Anchored on the CLOSING QUOTE so it cannot collide with the btcheck
-        # rule that rewrites the leading "NN.0, " on the same line; the two patterns
-        # overlap in text but replace disjoint ranges, in either order.
-        ('bt-check/bt_check.r', f'expects driver v{old}"', f'expects driver v{new}"', 1),
+        # ⚠ BTCheck's Get Info string USED to name the driver version it expects
+        # ("99.109, expects driver v18.5"), and this rule moved it. Release 18.6's plain
+        # style dropped the words, so the rule went with them: the expectation lives in
+        # kExpectedDriverTag (moved above) and BTCheck's log banner states it.
     ]
 
 
@@ -244,9 +256,11 @@ def edits_for_btcheck(old, new):
             # ⚠ The comment beside the BCD bytes IS a version stamp. Stale copies of
             # exactly this shape have bitten this project three separate times.
             ('bt-check/bt_check.r', f'/* {oldstr} -- BCD.', f'/* {new} -- BCD.', 1),
-            ('bt-check/bt_check.r', f'"{oldstr}",', f'"{new}",', 1),
-            ('bt-check/bt_check.r', f'"{oldstr}, expects driver v',
-                                    f'"{new}, expects driver v', 1),
+            # ★ Release 18.6: TWO short strings (vers 1 and vers 2), and vers(1)'s LONG
+            # string is the plain number, anchored on the closing brace. It used to read
+            # "<ver>, expects driver v<driver>".
+            ('bt-check/bt_check.r', f'"{oldstr}",', f'"{new}",', 2),
+            ('bt-check/bt_check.r', f'"{oldstr}"\n}};', f'"{new}"\n}};', 1),
         ]
         return edits
     if int(new) > 99:
@@ -276,11 +290,17 @@ def edits_for_panel(old, new):
     om, on = old.split('.')
     nm, nn = new.split('.')
     return [
-        ('cpanel/bt_panel.r', f'0x0{om}, 0x{on}0, development',
-                              f'0x0{nm}, 0x{nn}0, development', 2),
-        # ⚠ TWO of each now: the panel carries vers(1) for Apple System Profiler AND
-        # vers(2) for the Finder, with identical strings. See the note in bt_panel.r.
+        # ★ Release 18.6: finalStage, not development (ASP printed "19.2d0" for released
+        # 17.6's panel), and the major as a real BCD byte -- it was spelled "0x0" + "19",
+        # a three-digit literal that only happened to equal 0x19.
+        ('cpanel/bt_panel.r', f'0x{bcd(om):02X}, 0x{on}0, finalStage',
+                              f'0x{bcd(nm):02X}, 0x{nn}0, finalStage', 2),
+        # ⚠ TWO short strings: the panel carries vers(1) for Apple System Profiler AND
+        # vers(2) for the Finder. See the note in bt_panel.r.
         ('cpanel/bt_panel.r', f'"{old}",', f'"{new}",', 2),
+        # ★ And vers(1)'s LONG string is the plain number (release 18.6), anchored on the
+        # closing brace. vers(2)'s long string names the release: see --release.
+        ('cpanel/bt_panel.r', f'"{old}"\n}};', f'"{new}"\n}};', 1),
         # ⚠ The versioned .bin's filename. Kept here rather than derived at stage
         # time so it cannot disagree with the 'vers' resource -- BTCheck v46 shipped
         # writing BTCheck_v45.log because its version lived in four hand-maintained
@@ -288,16 +308,35 @@ def edits_for_panel(old, new):
         ('cpanel/CMakeLists.txt', f'set(PANEL_VER "{old}")',
                                   f'set(PANEL_VER "{new}")', 1),
         ('cpanel/bt_panel.r', f'"{old}, github', f'"{new}, github', 1),
-        # ⚠ THE DESCRIPTION EMBEDS THE VERSION, and the first real use of this script
-        # missed it: the panel bumped to 3.1 while its Get Info description still read
-        # "Bluetooth 3.0 - ...". The convention is therefore ENFORCED here -- a
-        # description that does not start "Bluetooth <ver> - " makes this refuse, which
-        # surfaces the drift instead of shipping it.
-        ('cpanel/bt_panel.r', f'"Bluetooth {old} - ', f'"Bluetooth {new} - ', 2),
+        # ⚠ The "Bluetooth <ver> - <description>" rule that stood here is RETIRED with the
+        # description itself (release 18.6, plain versions). It existed because the panel
+        # once bumped to 3.1 while its Get Info text still read "Bluetooth 3.0 - ..."; the
+        # long-string rule above covers the same drift for the plain form.
         ('cpanel/bt_panel.c', f'BTPanel {old}  ticks ', f'BTPanel {new}  ticks ', 1),
         ('cpanel/bt_panel.c', f'Control panel {old} - device scanning',
                               f'Control panel {new} - device scanning', 1),
     ]
+
+
+# ★ RELEASE 18.6 (user, 2026-11-16): every file of the stack carries a vers(2) whose LONG
+# string names the release it shipped in -- "OS 9 Bluetooth 18.6" -- which Get Info shows
+# under the file name and Extensions Manager / ASP show in their Package column. FIVE
+# files, one copy each, moved together or not at all. The strip (csm/) and the switcher
+# keep their OWN version numbers by hand, as before; only this package string is shared.
+RELEASE_FILES = ['bt_probe.r', 'bt_switch.r', 'cpanel/bt_panel.r', 'csm/bt_csm.r',
+                 'bt-check/bt_check.r']
+
+
+def current_release():
+    m = re.search(r'"OS 9 Bluetooth (\d{1,2}\.\d)"', read('bt_probe.r'))
+    if not m:
+        sys.exit("could not read the release from bt_probe.r's vers(2) -- has it moved?")
+    return m.group(1)
+
+
+def edits_for_release(old, new):
+    return [(rel, f'"OS 9 Bluetooth {old}"', f'"OS 9 Bluetooth {new}"', 1)
+            for rel in RELEASE_FILES]
 
 
 def check_version(label, v):
@@ -319,17 +358,23 @@ def main():
     ap.add_argument('--driver')
     ap.add_argument('--panel')
     ap.add_argument('--btcheck')
+    ap.add_argument('--release')
     ap.add_argument('--apply', action='store_true')
     a = ap.parse_args()
 
     cur_drv, cur_btc, cur_pnl = current()
-    if not (a.driver or a.panel or a.btcheck):
+    cur_rel = current_release()
+    if not (a.driver or a.panel or a.btcheck or a.release):
         print(f"   driver  {cur_drv}   (block tag {tag(cur_drv)})")
         print(f"   panel   {cur_pnl}")
         print(f"   btcheck {cur_btc}")
+        print(f"   release {cur_rel}   (vers 2 of all {len(RELEASE_FILES)} files)")
         return 0
 
     edits = []
+    if a.release:
+        check_version('release', a.release)
+        edits += edits_for_release(cur_rel, a.release)
     if a.driver:
         check_version('driver', a.driver)
         edits += edits_for_driver(cur_drv, a.driver)

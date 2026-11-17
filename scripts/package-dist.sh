@@ -25,12 +25,14 @@ OUT="${1:?output directory}"
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 
 # The five shipped pieces. Paths only: everything else comes from the MacBinary header.
+# Release 18.6 (2026-11-16): driver 18.6, switcher 1.7 (unchanged code), panel 19.8,
+# strip 2.7, BTCheck 99.110.
 SRCS="
-$ROOT/build/USBBluetoothSupport-v17.6.bin
+$ROOT/build/USBBluetoothSupport-v18.6.bin
 $ROOT/build/USBBluetoothSwitch-v1.7.bin
-$ROOT/cpanel/build/Bluetooth-19.2.bin
-$ROOT/csm/build/BluetoothStrip-v2.5.bin
-$ROOT/bt-check/build/BTCheck_v99.105.bin
+$ROOT/cpanel/build/Bluetooth-19.8.bin
+$ROOT/csm/build/BluetoothStrip-v2.7.bin
+$ROOT/bt-check/build/BTCheck_v99.110.bin
 "
 
 mkdir -p "$OUT"
@@ -59,6 +61,14 @@ open(dst + '/..namedfork/rsrc', 'wb').write(d[rstart:rstart+rlen])
 print(f"{name}\t{typ}\t{cre}")
 PY
 )
+
+    # 1b. A PUBLIC download gets a plain name (user directive, 2026-08-13: the revision
+    #     goes in the README and the 'vers', never the filename). BTCheck's build names
+    #     the app "BTCheck_v<ver>" so test builds can be told apart; the release does
+    #     not need that, and its log file and window title still carry the version.
+    case "$NAME" in
+        BTCheck_v*) mv "$TMP/$NAME" "$TMP/BTCheck"; NAME="BTCheck" ;;
+    esac
 
     # 2. stamp type/creator + Finder flags.
     #    B = kHasBundle (the control panel and strip carry icon families),

@@ -170,6 +170,14 @@ unsigned long gBhLive;
 static bd_addr_t gBhPeerAddr;     /* peer of the channel we accepted, for the reconnect      */
 static btstack_timer_source_t gBhReconnTimer;
 static int gBhReconnArmed;
+/* ★ v18.0: the half-open watchdog. A HID channel accepted at INCOMING_CONNECTION that never
+ * reaches CONNECTION_OPENED is torn down after kHidWdMs so a fresh attempt opens it clean.
+ * Single-cid by design (one pending stall watched at a time); the callback's per-cid
+ * registry check means a second, already-open device on another cid is never touched. */
+static btstack_timer_source_t gHidWdTimer;
+static int    gHidWdArmed;
+unsigned long gHidWdCid;           /* the accepted-but-not-yet-open cid being watched */
+unsigned long gHidWdFired;         /* half-open teardowns done (bounded)              */
 static int gBhAdopt;            /* v15.0: INCOMING's adopt decision, reused for the address */
 
 /* ★★★★★★ v14.1: THE BATTERY PROBE. Does this keyboard ANSWER a GET_REPORT?
@@ -437,6 +445,70 @@ static void BT_PagingWindowTick(void)
     if (((unsigned long)hal_time_ms() - gPageWinOpenMs) > kPageWindowMaxMs)
         BT_ClosePagingWindow();
 }
+
+/* ★★★★★★ a1044pair1: A PAIR CLICKED DURING A SCAN WAITS FOR THE SCAN TO FINISH.
+ *
+ * BTstack sends Create_Connection as soon as gap_dedicated_bonding queues it
+ * (hci.c hci_run_general_pending_commands): it does not wait for an inquiry. Our scan
+ * runs 10.24 s (gap_inquiry_start(8)), and people click Pair the moment a device shows
+ * up in it. A Bluetooth 1.x controller may refuse to page while it inquires, with 0x0C
+ * Command Disallowed -- the very code the A1044 gave on 2026-09-07 (v8.3: Create_Connection
+ * 0x0C, then Inquiry 0x0C), the run that retired paging on it. Whatever caused it then,
+ * this rules it out now. The SDP query already obeys the same rule ("wait for the
+ * inquiry to finish before connecting, rather than stopping it early", at
+ * GAP_EVENT_INQUIRY_COMPLETE): no Inquiry_Cancel, so no new variable if it fails.
+ *
+ * ⚠ The page fires from a TIMER, never inside the event handler: BTstack emits events
+ * before finishing its own transitions (see bh_reconnect_timeout). kPairDeferGoMs after
+ * GAP_EVENT_INQUIRY_COMPLETE; the same timer is armed first at kPairDeferMaxMs, past the
+ * scan's own 10.24 s, so a lost event cannot strand the Pair.
+ * [[feedback_guards_must_not_latch]]
+ * ⚠ a1044pair2: the 0x0C the A1044 actually gave on 2026-11-16 had a different cause -- a
+ * Pair AFTER the scan paged a mouse the scan's SDP query was already paging. See
+ * BT_PairOnExistingLink. This deferral still stands for the case it was written for. */
+#define kPairDeferMaxMs   12000UL
+#define kPairDeferGoMs      100UL
+static btstack_timer_source_t gPairDeferTimer;
+static int           gPairDeferArmed, gPairDeferred;
+static unsigned long gPairDeferHi, gPairDeferLo;
+unsigned long        gPairDeferCount;     /* Pair clicks that waited for a scan to finish */
+
+/* a1044pair2: defined after the arm's globals, below. */
+static int BT_PairOnExistingLink(const bd_addr_t addr);
+
+static void pair_deferred_timeout(btstack_timer_source_t *ts)
+{
+    bd_addr_t addr;
+    (void)ts;
+    gPairDeferArmed = 0;
+    if (!gPairDeferred) return;
+    gPairDeferred = 0;
+    if (hci_get_state() != HCI_STATE_WORKING) {
+        gPairRc = 0x100UL | 0xFEUL;      /* our own code: stack not up */
+        return;
+    }
+    addr[0] = (uint8_t)((gPairDeferHi >> 16) & 0xFF);
+    addr[1] = (uint8_t)((gPairDeferHi >>  8) & 0xFF);
+    addr[2] = (uint8_t)( gPairDeferHi        & 0xFF);
+    addr[3] = (uint8_t)((gPairDeferLo >> 16) & 0xFF);
+    addr[4] = (uint8_t)((gPairDeferLo >>  8) & 0xFF);
+    addr[5] = (uint8_t)( gPairDeferLo        & 0xFF);
+    /* a1044pair2: the device may have linked while we waited (it paged us). Use that
+     * link rather than page an address BTstack already has a connection object for. */
+    if (BT_PairOnExistingLink(addr)) return;
+    gPairPath = 2;                       /* the scan is down: page it now */
+    BT_OpenPagingWindow();
+    gPairRc   = 0x100UL | (unsigned long)(gap_dedicated_bonding(addr, 0) & 0xFF);
+}
+
+static void BT_PairDeferArm(unsigned long ms)
+{
+    if (gPairDeferArmed) btstack_run_loop_remove_timer(&gPairDeferTimer);
+    btstack_run_loop_set_timer_handler(&gPairDeferTimer, &pair_deferred_timeout);
+    btstack_run_loop_set_timer(&gPairDeferTimer, ms);
+    btstack_run_loop_add_timer(&gPairDeferTimer);
+    gPairDeferArmed = 1;
+}
 unsigned long gArmed, gArmedHi, gArmedLo, gArmedFired, gArmedRc;
 unsigned long gSuppCmds[2], gSuppCmdsGot;
 unsigned long gLocalVer, gLocalMfr;
@@ -446,6 +518,81 @@ unsigned long gBondDone, gBondStatus, gWroteKeyTried, gWroteKeyRc, gWroteKeyDone
 unsigned long gHidOutTried, gHidOutRc, gHidOutCid;
 unsigned long gJustBonded, gHidOutArmed;
 static bd_addr_t gJustBondedAddr;
+/* a1044pair2: fresh-bond connects NOT made because THIS device's channel was already
+ * open, and connects made by the fallback timer rather than at Authentication Complete.
+ * Published packed into kWHidOutGate's upper bytes (bt_probe.c), so the block does not
+ * grow and kWEnd stays 798. */
+unsigned long gHidOutSkipped, gHidOutByTimer;
+
+/* ★★★★★★ a1044pair2: PAIR USES THE DEVICE'S OWN LINK, IF ONE IS OPEN OR BEING MADE.
+ *
+ * ⭐ MEASURED 2026-11-16 (a1044pair1, BTCheck dfdf8b5c). The mouse's Pair came after its
+ * scan had ended (`waited for a scan 0`), so it took path 2 -- and the SDP query that
+ * GAP_EVENT_INQUIRY_COMPLETE starts (start_sdp_query_on_best_responder) was ALREADY paging
+ * that same mouse. gap_dedicated_bonding always allocates a NEW connection object
+ * (hci.c:9207 -> create_connection_for_bd_addr_and_type, which never looks for an existing
+ * one, and links it at the HEAD of the list), so BTstack sent a SECOND Create_Connection to
+ * an address it was already paging. The A1044 refused it: `0x0405 status 0x0C`, `bonding
+ * completions 1, status 0x0C`. BTstack then failed only the duplicate (hci.c:2776 frees the
+ * first match, the new one), the SDP query's link came up, the arm authenticated it, and the
+ * mouse paired. Harmless this time -- and our own doing, not the module refusing to page.
+ *
+ * ⇒ ASK BTSTACK'S OWN LIST, BT_ConnHandleForAddr's rule rather than a shadow:
+ *     OPEN              -> authenticate that link now                         (path 1)
+ *     being set up      -> send nothing; the arm authenticates it on Connection
+ *                          Complete (2948), whichever end opened it           (path 5)
+ *     none, going away  -> return 0 and let the caller page or wait as before.
+ * gLinkWasUp records which: 0x100 | 0 none, 1 open, 2 being set up, 3 going away.
+ *
+ * ⚠⚠ PATH 1 USED TO TEST gLastConnHandle / gConnPeer, WHICH NAME ONLY THE MOST RECENT LINK.
+ * With a mouse and a keyboard both linked, Pair on the older one failed the test and fell
+ * through to arm-and-wait, which waits for a NEW link and sent nothing. The same one-peer
+ * shadow already bit Disconnect -- see the note above BT_ConnHandleForAddr.
+ *
+ * ⚠ That this also explains 2026-09-07's 0x0C is a FIT, not a finding: no log from that run
+ * records whether a scan-end SDP page was in flight when Pair was clicked.
+ * ⚠ Interrupt-level safe: a list walk and at most one queued command. */
+static int BT_PairOnExistingLink(const bd_addr_t addr)
+{
+    hci_connection_t *lc = hci_connection_for_bd_addr_and_type(addr, BD_ADDR_TYPE_ACL);
+    if (lc == NULL) {
+        gLinkWasUp = 0x100UL;
+        return 0;
+    }
+    switch (lc->state) {
+    case OPEN:
+        gLinkWasUp = 0x101UL;
+        /* Authenticating it now, so the arm has nothing left to wait for. Left set, it
+         * fired on this device's NEXT connection -- a reconnect after a wake -- and
+         * re-authenticated a link nobody asked about. [[feedback_guards_must_not_latch]] */
+        gArmed     = 0;
+#if kHidOutgoingConnect
+        /* ...and open its HID channel when that authentication completes, if it has none.
+         * The panel now calls a linked input device with no channel "Linked, not ready"
+         * and leaves Pair enabled for it, so Pair is the way to make it work -- and with a
+         * key already held, no Link Key Notification will come to arm the connect. Safe
+         * against a channel the device is opening itself: BT_HidOutConnectNow skips an
+         * address that has one, and hid_host_connect refuses one that is opening. */
+        memcpy(gJustBondedAddr, addr, sizeof(bd_addr_t));
+        gHidOutArmed = 1;
+#endif
+        gPairPath  = 1;                      /* authenticate the existing link */
+        gPairRc    = 0x100UL | (unsigned long)
+                     (hci_send_cmd(&hci_authentication_requested, lc->con_handle) & 0xFF);
+        return 1;
+    case SEND_CREATE_CONNECTION:
+    case SENT_CREATE_CONNECTION:
+    case RECEIVED_CONNECTION_REQUEST:
+    case ACCEPTED_CONNECTION_REQUEST:
+        gLinkWasUp = 0x102UL;
+        gPairPath  = 5;                      /* its link is being made; the arm takes it */
+        gPairRc    = 0x100UL;                /* nothing sent, nothing to refuse */
+        return 1;
+    default:
+        gLinkWasUp = 0x103UL;                /* going away: as if there were none */
+        return 0;
+    }
+}
 unsigned long gHandlerEvtRing[kHandlerRingLen], gHandlerEvtIdx, gHandlerEvtTotal;
 
 unsigned long gHidPeerHi, gHidPeerLo;   /* who reached L2CAP (incoming connection) */
@@ -1659,6 +1806,102 @@ static int HidDevAddrAt(short i, unsigned long *hi, unsigned long *lo)
     return 1;
 }
 
+/* a1044pair2: is THIS address's HID channel open? A slot is claimed only at a successful
+ * HID_SUBEVENT_CONNECTION_OPENED and released at CLOSED, so a slot is exactly "open now". */
+static short HidDevSlotForAddr(const bd_addr_t a)
+{
+    short i, k;
+    for (i = 0; i < kHidDevSlots; i++) {
+        if (gHidDev[i].cid == 0) continue;
+        for (k = 0; k < 6; k++)
+            if (gHidDev[i].addr[k] != a[k]) break;
+        if (k == 6) return i;
+    }
+    return -1;
+}
+
+#if kHidOutgoingConnect
+/* ★★★★★★ a1044pair2: THE FRESH-BOND CONNECT ASKS ABOUT THIS DEVICE, NOT ANY DEVICE.
+ *
+ * ⭐ MEASURED 2026-11-16 (a1044pair1, BTCheck dfdf8b5c). The A1015 paired first and its
+ * channel opened (we asked, at Authentication Complete). Then the A1016 paired from OS 9:
+ * PIN 0000 answered, Link Key Notification, Auth Complete #1 status 0x00 on its own handle
+ * 0x0031, link encrypted -- and no HID channel ever followed. `fresh bonds seen 2`,
+ * `connects attempted 1`, `slots claimed 1` (the mouse). Its light kept blinking and it
+ * never typed, while the panel said Connected.
+ *
+ * ⇒ The guard was `!gBhLive`: "no HID channel is open ANYWHERE". The mouse's channel made
+ * it false, so the keyboard's connect was skipped -- and the latch stayed armed, waiting for
+ * an Auth Complete while nothing at all was open. That guard dates from 13.9, when a
+ * keyboard was the only device; the second device arrived in 15.0 and nothing re-asked it.
+ * v18.0 fixed the same mouse-masks-keyboard flaw in the half-open watchdog ("PER-CID VIA THE
+ * REGISTRY, not the single gBhLive") and left this one.
+ *
+ * ⇒ Now: skip only when THIS address already has an open channel (HidDevSlotForAddr). A
+ * channel the device is opening itself is still protected, by BTstack: hid_host_connect
+ * refuses an address that already has a connection object (hid_host.c:1254), so this can
+ * never make a second connection to the same device.
+ *
+ * ⚠ ONE SHOT PER ARMING, skip or call: the latch clears here either way, so it can never
+ * fire on a later Authentication Complete that has nothing to do with this pairing. It is
+ * armed by a Link Key Notification (a fresh bond) and, from a1044pair2, by a Pair on a
+ * device whose link is already open (BT_PairOnExistingLink, path 1).
+ * ⚠ Interrupt level, like every caller: a slot scan, a timer unlink, one hid_host call. */
+#define kHidOutFallbackMs  3000UL
+static btstack_timer_source_t gHidOutTimer;
+static int                    gHidOutTimerArmed;
+
+static void BT_HidOutConnectNow(void)
+{
+    uint16_t cid = 0;
+    gHidOutArmed = 0;
+    if (gHidOutTimerArmed) {
+        btstack_run_loop_remove_timer(&gHidOutTimer);
+        gHidOutTimerArmed = 0;
+    }
+    if (HidDevSlotForAddr(gJustBondedAddr) >= 0) {   /* it has its channel: nothing to do */
+        gHidOutSkipped++;
+        return;
+    }
+    gHidOutTried++;
+    gHidOutRc  = 0x100UL | (unsigned long)
+                 hid_host_connect(gJustBondedAddr, HID_PROTOCOL_MODE_REPORT, &cid);
+    gHidOutCid = (unsigned long)cid;
+}
+
+/* ★ a1044pair2: AND IF NO AUTHENTICATION COMPLETE FOLLOWS THE BOND, CONNECT ANYWAY.
+ *
+ * Authentication Complete is emitted only to the side that sent Authentication_Requested.
+ * In this run the A1016 started the pairing itself, on the link the scan's SDP query had
+ * made: the opcode ring has PIN_Code_Request_Reply (0x040D) and the key write (0x0C11)
+ * BEFORE our Authentication_Requested (0x0411), which went out only when the user clicked
+ * OK on the passkey alert -- after typing. That late Pair is what produced the Auth Complete.
+ * Had OK come first, or never, nothing on our side would have completed an authentication.
+ *
+ * ⇒ So the Link Key Notification also starts this one-shot timer. Auth Complete normally
+ * arrives first (800 ms after the notification on the run the Link Key Notification note
+ * cites) and cancels it; kHidOutFallbackMs is well past that. If it fires,
+ * hid_host_connect's L2CAP channel asks for security level 2 itself, and BTstack
+ * authenticates with the new key and encrypts. */
+static void hid_out_fallback_timeout(btstack_timer_source_t *ts)
+{
+    (void)ts;
+    gHidOutTimerArmed = 0;
+    if (!gHidOutArmed) return;
+    gHidOutByTimer++;
+    BT_HidOutConnectNow();
+}
+
+static void BT_HidOutFallbackArm(void)
+{
+    if (gHidOutTimerArmed) btstack_run_loop_remove_timer(&gHidOutTimer);
+    btstack_run_loop_set_timer_handler(&gHidOutTimer, &hid_out_fallback_timeout);
+    btstack_run_loop_set_timer(&gHidOutTimer, kHidOutFallbackMs);
+    btstack_run_loop_add_timer(&gHidOutTimer);
+    gHidOutTimerArmed = 1;
+}
+#endif
+
 static void BhRecordReport(unsigned long cid,
                            const unsigned char *rep, unsigned short n)
 {
@@ -2285,7 +2528,12 @@ static void hci_event_handler(uint8_t packet_type, uint16_t channel,
         gInqState        = 2;
         gInqComplStatus  = 0x100UL | (unsigned long)
                            gap_event_inquiry_complete_get_status(packet);
-        start_sdp_query_on_best_responder();
+        /* a1044pair1: a Pair that waited for this scan goes now, and the SDP query does
+         * not: it would call a second device (or the same one) at the same moment. */
+        if (gPairDeferred)
+            BT_PairDeferArm(kPairDeferGoMs);
+        else
+            start_sdp_query_on_best_responder();
         BT_StackPoll((unsigned long)hci_get_state());
         break;
 
@@ -2534,6 +2782,9 @@ static void hci_event_handler(uint8_t packet_type, uint16_t channel,
          * not a slip: both events carry the bd_addr at the same offset and hci.c:4781
          * does exactly this. There is no _notification_ accessor to use. */
         hci_event_link_key_request_get_bd_addr(packet, gJustBondedAddr);
+        /* a1044pair2: and a fallback, for a pairing the DEVICE started, which ends with
+         * no Authentication Complete on our side. See hid_out_fallback_timeout. */
+        BT_HidOutFallbackArm();
 #endif
         BT_StackPoll((unsigned long)hci_get_state());
         break;
@@ -2654,14 +2905,12 @@ static void hci_event_handler(uint8_t packet_type, uint16_t channel,
         /* ⚠ v13.9: `gBhOpened <= gBhClosed` was the third place this file inferred "no
          * channel is open" from counters, and it is wrong in the same states as the other
          * two -- see the note at gBhLive. Uses the maintained flag now. */
-        if (gHidOutArmed && !gBhLive
+        /* ⛔ a1044pair2: AND gBhLive WAS THE WRONG QUESTION FOR TWO DEVICES. It answers "is
+         * ANY channel open"; with the mouse up it skipped the keyboard's connect (measured
+         * 2026-11-16). BT_HidOutConnectNow asks about the address that just bonded. */
+        if (gHidOutArmed
             && hci_event_authentication_complete_get_status(packet) == 0) {
-            uint16_t cid = 0;
-            gHidOutArmed = 0;
-            gHidOutTried++;
-            gHidOutRc  = 0x100UL | (unsigned long)
-                         hid_host_connect(gJustBondedAddr, HID_PROTOCOL_MODE_REPORT, &cid);
-            gHidOutCid = (unsigned long)cid;
+            BT_HidOutConnectNow();
         }
 #endif
         /* ⚠ LEGACY FLOW ONLY. This is 0x06, emitted in response to
@@ -2859,8 +3108,17 @@ static void hci_event_handler(uint8_t packet_type, uint16_t channel,
                     unsigned long h = (unsigned long)
                         hci_event_connection_complete_get_connection_handle(packet);
                     if (kHidLongSupervision) BT_LinkCmdEnqueue(kLinkCmdSupervision, h);
+                    /* ★ v18.1 INSTRUMENT (read-only, NO behaviour change): read the link
+                     * policy the controller actually has on this link, to compare against
+                     * Tiger's 0x000F (docs/TIGER-HCI-TRACE.md). Chasing the A1015 sensor-off:
+                     * we never WRITE a policy (kHidLinkPolicy is off), so the mouse link runs on
+                     * the DEFAULT, and whether that default permits the low-power modes the
+                     * mouse wants is the one link parameter never measured. The read is now
+                     * unconditional; the WRITE stays gated so nothing changes. gPolicyReadBack
+                     * carries the value -- connect the MOUSE ALONE so it is the mouse's, not the
+                     * keyboard's (single global, last-read-wins). */
+                    BT_LinkCmdEnqueue(kLinkCmdPolicyRead, h);
                     if (kHidLinkPolicy) {
-                        BT_LinkCmdEnqueue(kLinkCmdPolicyRead,  h);
                         BT_LinkCmdEnqueue(kLinkCmdPolicyWrite, h);
                     }
                 }
@@ -3473,6 +3731,12 @@ static void hci_event_handler(uint8_t packet_type, uint16_t channel,
  * emit/finalize ordering and was not joined up to the handler choice. It is now. */
 #define kBhReconnMs    250UL
 #define kBhMaxReconn      3UL
+/* ★ v18.0: half-open watchdog timing. 4 s is ~15x the 271 ms healthy accept->open latency,
+ * so a merely slow channel is never torn down, and it is clear of BTstack's 10 s
+ * L2CAP_RTX_TIMEOUT_MS -- v13.8 chose 10 s, collided with it, and made its own run
+ * unreadable. Bounded so a peer that never opens cannot become a teardown/reconnect loop. */
+#define kHidWdMs       4000UL
+#define kHidWdMaxTears    3UL
 
 /* ★ v14.1: ask for the battery percentage, once, a couple of seconds after the channel
  * came up. Deliberately NOT sent from the OPENED handler itself: SET_PROTOCOL and the
@@ -3511,6 +3775,12 @@ static void bat_state_timeout(btstack_timer_source_t *ts)
 static btstack_timer_source_t gBatNextTimer;
 static unsigned long gBatNextArmed, gBatStartedMs;
 unsigned long gBatTargets, gBatGiveUps;
+/* v18.5: pin the intermittent "late device never battery-probed" gap. Instrument-only,
+ * no behavior change -- these only count what the scheduler already does. */
+unsigned long gBatOpenKicks;   /* HID opens (status 0) that kicked the scheduler -- should == devices that opened */
+unsigned long gBatSchedRuns;   /* bat_next_timeout fires */
+unsigned long gBatLastElig;    /* eligible (cid!=0 && !batDone) devices at the most recent pass's entry */
+unsigned long gBatArmNextNoop; /* BatArmNext calls suppressed because a pass was already armed */
 
 static void BatArmNext(void);
 
@@ -3520,6 +3790,10 @@ static void bat_next_timeout(btstack_timer_source_t *ts)
     int   pending = 0;
     (void)ts;
     gBatNextArmed = 0;
+    gBatSchedRuns++;                               /* v18.5 instrument */
+    { short e = 0, k; for (k = 0; k < kHidDevSlots; k++)
+          if (gHidDev[k].cid != 0 && !gHidDev[k].batDone) e++;
+      gBatLastElig = (unsigned long)e; }
 
     if (gBatCid != 0) {
         unsigned long now = (unsigned long)hal_time_ms();
@@ -3556,7 +3830,7 @@ static void bat_next_timeout(btstack_timer_source_t *ts)
 
 static void BatArmNext(void)
 {
-    if (gBatNextArmed) return;
+    if (gBatNextArmed) { gBatArmNextNoop++; return; }   /* v18.5 instrument */
     gBatNextArmed = 1;
     btstack_run_loop_set_timer_handler(&gBatNextTimer, &bat_next_timeout);
     btstack_run_loop_set_timer(&gBatNextTimer, kBatNextMs);
@@ -3651,6 +3925,38 @@ static void bh_reconnect_timeout(btstack_timer_source_t *ts)
                   hid_host_connect(gBhPeerAddr, HID_PROTOCOL_MODE_REPORT, &cid);
 }
 
+/* ★★★★★★ v18.0: THE HALF-OPEN WATCHDOG the v13.9 note scoped but did not build.
+ *
+ * v13.9 removed the teardown on the premise that L2CAP's own 10 s RTX frees a stalled slot
+ * and only a RETRY was missing. HW falsifies that premise: run 13's A1016 was accepted,
+ * never reached CONNECTION_OPENED, stayed in pairing mode with no reports, and the link
+ * supervision-timed-out (the 2026-09-17 run sat 31 minutes). And hid_host_connect no-ops on
+ * the surviving connection object (hid_host.c:1254), so the existing reconnect cannot help
+ * until that object is gone. So we tear the stalled channel down, then arm the reconnect --
+ * which is exactly what a hand power-cycle did, now automatic.
+ *
+ * ⚠ PER-CID VIA THE REGISTRY, not the single gBhLive: with a mouse already up gBhLive is 1
+ * and would mask a keyboard stalling on another cid. HidDevSlotForCid(cid) >= 0 means THIS
+ * cid reached OPENED and claimed a slot.
+ * ⚠ Bounded at kHidWdMaxTears -- a peer that never opens must not become a teardown loop.
+ * ⚠ Interrupt-safe: plain stores + BTstack calls, the pump's own secondary-interrupt home. */
+static void hid_watchdog_timeout(btstack_timer_source_t *ts)
+{
+    (void)ts;
+    gHidWdArmed = 0;
+    if (HidDevSlotForCid((uint16_t)gHidWdCid) >= 0) return;  /* it opened; not half-open */
+    if (gHidWdFired >= kHidWdMaxTears) return;               /* bounded: no teardown loop */
+    gHidWdFired++;
+    (void)hid_host_disconnect((uint16_t)gHidWdCid);          /* free the stalled slot     */
+    /* arm the existing reconnect; by the time it fires the object has finalized, so
+     * hid_host_connect no longer no-ops. gBhPeerAddr is the stalled device (set at accept). */
+    if (gBhReconnArmed) btstack_run_loop_remove_timer(&gBhReconnTimer);
+    btstack_run_loop_set_timer_handler(&gBhReconnTimer, &bh_reconnect_timeout);
+    btstack_run_loop_set_timer(&gBhReconnTimer, kBhReconnMs);
+    btstack_run_loop_add_timer(&gBhReconnTimer);
+    gBhReconnArmed = 1;
+}
+
 
 /* ★★★★★★ v9.5: THE CANONICAL HID HOST'S EVENT HANDLER.
  *
@@ -3715,6 +4021,21 @@ static void hid_host_evt_handler(uint8_t type, uint16_t ch, uint8_t *packet,
         if (gBhAdopt)
             hid_subevent_incoming_connection_get_address(packet, gBhPeerAddr);
         gBhIncomingMs = hal_time_ms();
+        /* ★ v18.0: ARM THE HALF-OPEN WATCHDOG for the cid that is connecting. If this accept
+         * never reaches CONNECTION_OPENED, hid_watchdog_timeout tears it down and reconnects.
+         * Re-get the cid from the packet -- inCid above is out of scope here. */
+        {
+            unsigned long wcid =
+                (unsigned long)hid_subevent_incoming_connection_get_hid_cid(packet);
+            if (gHidWdFired < kHidWdMaxTears) {
+                if (gHidWdArmed) btstack_run_loop_remove_timer(&gHidWdTimer);
+                gHidWdCid = wcid;
+                btstack_run_loop_set_timer_handler(&gHidWdTimer, &hid_watchdog_timeout);
+                btstack_run_loop_set_timer(&gHidWdTimer, kHidWdMs);
+                btstack_run_loop_add_timer(&gHidWdTimer);
+                gHidWdArmed = 1;
+            }
+        }
         break;
 
     case HID_SUBEVENT_CONNECTION_OPENED:
@@ -3722,6 +4043,16 @@ static void hid_host_evt_handler(uint8_t type, uint16_t ch, uint8_t *packet,
          * bare 0 could not be told from "never opened". */
         gBhOpenedStatus = 0x100UL | (unsigned long)
             hid_subevent_connection_opened_get_status(packet);
+        /* ★ v18.0: CONNECTION_OPENED concluded the setup (success OR failure), so the watched
+         * cid is no longer half-open -- cancel its watchdog. A failure is handled by the
+         * existing reconnect; the watchdog only fires when OPENED never comes at all. */
+        if ((unsigned long)hid_subevent_connection_opened_get_hid_cid(packet) == gHidWdCid) {
+            /* ★ v18.0: the watched cid concluded setup (success or failure) -- cancel its watchdog. */
+            if (gHidWdArmed) {
+                btstack_run_loop_remove_timer(&gHidWdTimer);
+                gHidWdArmed = 0;
+            }
+        }
         if (hid_subevent_connection_opened_get_status(packet) == 0) {
             /* ★ CLAIM A SLOT. This event is the one place a connection becomes usable
              * whichever direction opened it -- the note below says exactly that, and it
@@ -3801,6 +4132,7 @@ static void hid_host_evt_handler(uint8_t type, uint16_t ch, uint8_t *packet,
              * every connected device in turn. v14.1 armed the probe directly here and
              * latched on gBatPctRc, so exactly one device per session was ever asked --
              * always the keyboard, because it connected first. */
+            gBatOpenKicks++;        /* v18.5 instrument: this open kicked the scheduler */
             BatArmNext();
         } else {
             gBhFailedOpens++;
@@ -4486,14 +4818,9 @@ int BT_PairDevice(unsigned long hi, unsigned long lo)
     gArmedLo = lo;
     gArmed   = 1;
 
-    gLinkWasUp = 0x100UL | (gLastConnHandle != 0 ? 1UL : 0UL);
-    if (gLastConnHandle != 0 && gConnPeerHi == hi && gConnPeerLo == lo) {
-        gPairPath = 1;                       /* authenticate the existing link */
-        gPairRc = 0x100UL | (unsigned long)
-                  (hci_send_cmd(&hci_authentication_requested,
-                                (hci_con_handle_t)gLastConnHandle) & 0xFF);
-        return 0;
-    }
+    /* a1044pair2: path 1 (an open link) and path 5 (a link being made) are decided from
+     * BTstack's own connection list, by THIS address. See BT_PairOnExistingLink. */
+    if (BT_PairOnExistingLink(addr)) return 0;
     /* ★★★★ NO LINK: ARM AND WAIT. DO NOT TRY TO PAGE THE DEVICE.
      *
      * ⚠⚠ THIS USED TO CALL gap_dedicated_bonding, AND THAT CALL WAS ACTIVELY HARMFUL.
@@ -4569,8 +4896,89 @@ int BT_PairDevice(unsigned long hi, unsigned long lo)
     {
         unsigned long lmp = (gLocalVer & 0x1000000UL)
                           ? ((gLocalVer >> 8) & 0xFFUL) : 0UL;
-        if (lmp >= 4) {
-            gPairPath = 2;          /* page it ourselves: modern controller */
+        uint32_t      cod = 0;
+        int           isKbd = 0, k;
+        /* ★ v17.8: PAGE FROM OUR BT 1.1 DBT-120 TOO, not only a modern controller.
+         *
+         * The lmp>=4 gate was written for a dongle reporting LMP 12 (BT 5.3). The DBT-120
+         * in hand reports LMP 1 (BT 1.1) -- genuinely old -- so it fell to the arm-and-wait
+         * branch below and sent NOTHING (gPairPath 3). The A1016/A1015 are bonded to the
+         * A1044's address, never to this dongle, so they never page it: pairing could not
+         * even begin, exactly as the note above predicts for a controller the keyboard has
+         * never seen. Measured runs 4-8: "PATH: ARMED AND WAITING -- nothing was sent."
+         *
+         * ⛔ SUPERSEDED by a1044pair1 below: the next sentence's premise was refuted by the
+         * A1044's own 2026-09-15 logs, and the A1044 now pages a mouse too.
+         * ⚠ lmp == 1 ONLY, not "< 4". LMP 2 is the A1044, which REJECTS Create_Connection
+         * (0x0C) and the refusal poisons its inquiry (see 4497-4531) -- it MUST stay on
+         * arm-and-wait, so the priority device is byte-for-byte unchanged. The DBT-120 at
+         * LMP 1 ACCEPTS Create_Connection (measured: 0x04 PAGE TIMEOUT = accepted + paged,
+         * never an 0x0405 rejection), so paging it is safe and is the only way to fresh-pair
+         * a device that is not already bonded to it. The clock offset the page needs is
+         * injected in the transport (hci_transport_os9.c, BT_PageParamsFor) so it is not a
+         * blind page. The arm above still stands: if the dongle refuses or the device pages
+         * us first, the inbound path answers unchanged. */
+        /* ★ v17.9: PAGE MICE, ARM-AND-WAIT FOR KEYBOARDS (operator choice, 2026-11-02).
+         *
+         * The A1016 only completes LEGACY pairing as the MASTER -- the way it reaches Tiger
+         * and the way it paged us in run 3 (inbound). When WE page it (making it the SLAVE)
+         * the LMP authentication collides: 0x22 LMP Response Timeout, no PIN request ever
+         * reached, no key (measured runs 10-12). The A1015 MOUSE is immune because its PIN
+         * is fixed host-side (0000) and the device does not participate in the LMP exchange,
+         * so it pairs fine as a slave. So here we page only a POINTING device; for a
+         * KEYBOARD we fall through to arm-and-wait and let it page us as master.
+         * CoD comes from the inquiry responder table. gRespAddr is big-endian, and the
+         * (hi,lo) params pack it as addr[0..2] and addr[3..5] (see the block publisher). */
+        for (k = 0; k < gRespCount; k++) {
+            unsigned long rhi = ((unsigned long)gRespAddr[k][0] << 16)
+                              | ((unsigned long)gRespAddr[k][1] << 8)
+                              |  (unsigned long)gRespAddr[k][2];
+            unsigned long rlo = ((unsigned long)gRespAddr[k][3] << 16)
+                              | ((unsigned long)gRespAddr[k][4] << 8)
+                              |  (unsigned long)gRespAddr[k][5];
+            if (rhi == hi && rlo == lo) { cod = gRespCoD[k]; break; }
+        }
+        /* keyboard = peripheral major (5) with the keyboard minor bit 0x40 set. A pointing
+         * device (0x80) or an unknown CoD (0) is NOT a keyboard, so it still gets paged. */
+        isKbd = (cod_major(cod) == BT_PICK_PERIPHERAL) && ((cod & 0x40UL) != 0);
+        /* ★★★★★★ a1044pair1 (2026-11-16): THE A1044 PAGES A MOUSE TOO -- lmp 1..3, not lmp 1.
+         *
+         * ⛔ WITHOUT THIS, NOTHING PAIRS ON THE A1044 FROM OS 9 ALONE. Pair there only
+         * armed and waited, and a device pages only the host it is bonded to (one bond,
+         * docs/A1016-REPORT-DESCRIPTOR.md). Every pairing that ever worked on the A1044
+         * rode a bond TIGER had made (docs/SHIP-TEST-RUNBOOK.md T13, and 11f3d09's own
+         * note): a requirement on Mac OS X, against this project's whole goal. Moving the
+         * A1016/A1015 off the DBT-120 hit it on 2026-11-16.
+         *
+         * ⚠⚠ THE RULE'S PREMISE WAS REFUTED A WEEK AFTER IT WAS MADE, BY OUR OWN LOGS. v8.3
+         * stopped paging on the A1044 after 2026-09-07's refusals (0x12 twice, the first to
+         * the wrong device; then 0x0C, with Inquiry 0x0C after it). On 2026-09-15 driver
+         * 12.2 on this A1044 (LMP 2) logged `ACL connections OK 3` against `Connection
+         * Requests 1`: at least two OUTGOING connections (the SDP query to a phone)
+         * accepted (logs/BTCheck_v99.47_2026-09-15_drv12.2_*). The rule was never
+         * revisited, and 16.9 / 17.8 carried it forward as fact.
+         *
+         * ⇒ So the A1044 gets exactly the DBT-120's measured recipe (v17.8/v17.9): page a
+         * POINTING device with the inquiry's clock offset (the transport injects it) inside
+         * the 10.24 s pairing window; arm-and-wait for a KEYBOARD, which pairs as master.
+         * Apple's literal packet type 0x0800 already goes out on LMP < 4 (bt_probe.c), as
+         * it did in those accepted September connections. LMP 3 (Bluetooth 2.0) is the same
+         * legacy-pairing generation and goes the same way. The arm above still stands: if
+         * the module refuses, or the device pages us first, the inbound path answers. */
+        if (lmp >= 4 || (lmp >= 1 && lmp <= 3 && !isKbd)) {
+            /* a1044pair1: a scan still running is let finish first -- see
+             * pair_deferred_timeout. Set before anything that could emit an event. */
+            if (gInqState == 1) {
+                gPairDeferHi  = hi;
+                gPairDeferLo  = lo;
+                gPairDeferred = 1;
+                gPairDeferCount++;
+                gPairPath     = 4;      /* waiting for the scan to finish, then page */
+                gPairRc       = 0x100UL;
+                BT_PairDeferArm(kPairDeferMaxMs);
+                return 0;
+            }
+            gPairPath = 2;          /* page it ourselves: modern controller, or a pre-2.1 mouse */
             /* ⚠ BEFORE the call, not after: the page starts inside it. */
             BT_OpenPagingWindow();
             gPairRc   = 0x100UL | (unsigned long)
@@ -4581,6 +4989,33 @@ int BT_PairDevice(unsigned long hi, unsigned long lo)
 
     gPairPath = 3;                  /* armed, waiting for the device to page us */
     gPairRc   = 0x100UL;            /* armed successfully; nothing was sent */
+    return 0;
+}
+
+/* ★ v17.8: the inquiry's page-scan-repetition-mode + clock offset for one address, so a
+ * Create_Connection pages the device at its known scan phase instead of doing a blind page
+ * that runs out the page timeout on a slow BT 1.1 dongle (the DBT-120's 0x04 PAGE TIMEOUT,
+ * runs 4-8). The transport calls this as it sends each command (hci_transport_os9.c).
+ *
+ * addr6le is the BD_ADDR exactly as it sits in the Create_Connection parameters: LITTLE-
+ * endian, LSB first. gRespAddr is big-endian (addr[0]=MSB), so the compare is reversed. On
+ * a hit *psrm is the stored repetition mode and *clkoff is the stored 15-bit clock offset
+ * with bit 15 set (Create_Connection's "clock offset valid" flag). Returns 1 on a hit; 0
+ * leaves the caller's blind-page values standing. Interrupt-level safe: reads only. */
+int BT_PageParamsFor(const unsigned char *addr6le,
+                     unsigned char *psrm, unsigned short *clkoff)
+{
+    int k;
+    for (k = 0; k < gRespCount; k++) {
+        if (gRespAddr[k][0] == addr6le[5] && gRespAddr[k][1] == addr6le[4] &&
+            gRespAddr[k][2] == addr6le[3] && gRespAddr[k][3] == addr6le[2] &&
+            gRespAddr[k][4] == addr6le[1] && gRespAddr[k][5] == addr6le[0]) {
+            uint32_t parm = gRespParm[k];
+            if (psrm)   *psrm   = (unsigned char)((parm >> 8) & 0xFFU);
+            if (clkoff) *clkoff = (unsigned short)(((parm >> 16) & 0x7FFFU) | 0x8000U);
+            return 1;
+        }
+    }
     return 0;
 }
 

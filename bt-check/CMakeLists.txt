@@ -33,7 +33,7 @@ add_compile_options(-Wno-multichar -Wall)
 #
 # Bumping THIS is now the whole job: it names the app and is injected into the C so
 # the log, the title and the banner cannot drift from it again.
-set(BTCHECK_VER "99.105")
+set(BTCHECK_VER "99.110")
 
 add_application(BTCheck_v${BTCHECK_VER}
     bt_check.c

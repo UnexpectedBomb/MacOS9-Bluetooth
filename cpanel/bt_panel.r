@@ -25,19 +25,26 @@
  * checks what is installed. A ROM is not an application; the rule belongs to the ROM
  * build, not to every file in the project.
  *
- * ⚠ BOTH RESOURCES CARRY THE SAME STRINGS, and scripts/bump-version.py expects TWO of
- * each pattern in this file. Adding a third vers, or wording them differently, breaks
- * the stamper -- which is the point: it fails loudly rather than letting them drift. */
+ * ★ RELEASE 18.6 (user, 2026-11-16): PLAIN VERSIONS, the shape approved for AirPort 2.0.
+ * vers(1) is the number alone in both strings (Get Info's "Version:" line, the Version
+ * columns); vers(2)'s long string names the release every file of the stack came from,
+ * OS 9 Bluetooth <release> (the line under the name, the Package column). They used to carry
+ * identical "Bluetooth <ver> - <what changed>" strings, which put a changelog in Get Info.
+ *
+ * ⚠ AND THE STAGE IS finalStage NOW. Through 19.7 both resources said `development`,
+ * including in release 17.6, so ASP would have shown "19.2d0" for a released panel.
+ * scripts/bump-version.py expects the numeric pair twice and "<ver>" three times (two
+ * short strings and vers(1)'s long one), and refuses to write if either count is off. */
 resource 'vers' (1) {
-    0x019, 0x20, development, 0x00, verUS,
-    "19.2",
-    "Bluetooth 19.2 - idle at boot no longer reads as a fault"
+    0x19, 0x80, finalStage, 0x00, verUS,
+    "19.8",
+    "19.8"
 };
 
 resource 'vers' (2) {
-    0x019, 0x20, development, 0x00, verUS,
-    "19.2",
-    "Bluetooth 19.2 - idle at boot no longer reads as a fault"
+    0x19, 0x80, finalStage, 0x00, verUS,
+    "19.8",
+    "OS 9 Bluetooth 18.6"
 };
 
 /* ---- Finder bundle, so the supplied icon family actually shows -------------- *
@@ -50,7 +57,7 @@ resource 'vers' (2) {
 
 /* The required signature resource. Content is conventionally a version string. */
 data 'BTcp' (0) {
-    "19.2, github.com/UnexpectedBomb"
+    "19.8, github.com/UnexpectedBomb"
 };
 
 /* FREF: file type 'APPL', local icon ID 0, empty name. */

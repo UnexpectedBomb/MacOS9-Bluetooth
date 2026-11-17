@@ -682,6 +682,28 @@ void BT_LoadShowAllFlag(void)
         gShowAllDevices = 1;
 }
 
+/* ★ btwake1: "Allow Bluetooth devices to wake this computer", the same idiom. The panel's
+ * checkbox creates `Preferences:Bluetooth Wake Allowed` (checked) or deletes it, and tells
+ * a running driver at once with kCmdSetWake; this is what a driver loading at startup
+ * reads. EXISTENCE IS THE WHOLE MESSAGE. Absent = not allowed, which is also what a module
+ * comes up with after a USB reset, so a fresh install changes nothing until it is checked.
+ * ⚠ The apply is always requested, either way: SET or CLEAR, so the module's state is
+ * the user's choice and not whatever an earlier instance left behind. */
+void BT_LoadWakeFlag(void)
+{
+    FSSpec spec;
+    short  vRefNum;
+    long   dirID;
+
+    gWakeAllowed      = 0;
+    gWakeSrc          = 1;          /* the marker, read at load */
+    gWakeApplyPending = 1;
+    if (FindFolder(kOnSystemDisk, kPreferencesFolderType, kDontCreateFolder,
+                   &vRefNum, &dirID) != noErr) return;
+    if (FSMakeFSSpec(vRefNum, dirID, "\pBluetooth Wake Allowed", &spec) == noErr)
+        gWakeAllowed = 1;
+}
+
 
 /* ⚠ TEMP FILE THEN FSpExchangeFiles, exactly as the key file does and for the same
  * reason: a half-written live file is worse than a missing one, because a reader cannot

@@ -204,10 +204,19 @@ typedef struct {
     short         shownPct;           /* last value actually drawn */
     short         shownState;
     unsigned long lastRefresh;
+
+    /* ⭐ WHAT THE FOUR FILES LOOKED LIKE AT THE LAST READ, so a refresh that finds them
+     * unchanged reads NOTHING (idlefix1, 2026-11-15). Per file: modification date, data
+     * length, file number; all 0 = absent. See Refresh for why this matters. */
+    unsigned long fileStamp[4][3];
+    Boolean       haveStamps;         /* the device data above came from these stamps */
+    Boolean       batLive;            /* LoadBattery's answer at that read, re-applied every
+                                       * refresh: it is what promotes a dongle to kStHCI */
 } BTCsmState;
 
-#define kRefreshTicks  300            /* 5s: a battery does not move faster, and this
-                                       * is a file open + a bus walk, not a register */
+#define kRefreshTicks  300            /* 5s: a battery does not move faster. A refresh is a
+                                       * bus walk plus four catalog lookups; the files are
+                                       * READ only when one of them changed (see Refresh) */
 #define kLowPct        20             /* at or below this the gauge fill goes red */
 
 /* ---- freshness ----------------------------------------------------------- */
@@ -331,7 +340,13 @@ static void LoadDevices(BTCsmState *st)
 /* The levels. ⚠ Read ONLY when the file is from this boot -- see the header. A device
  * that answered this session but is not in the panel's list is still added, so a level
  * is never dropped just because the panel has not learned the device's kind yet. */
-static void LoadBattery(BTCsmState *st)
+/* ⭐ Returns TRUE iff the battery file was WRITTEN THIS BOOT with >=1 device -- i.e. our
+ * BTstack held a live connection this boot. That is the authoritative "our stack is live"
+ * signal (the writer emits it only with a live link), and unlike ScanBusState's USB
+ * device-CLASS walk it sees a composite class-0 controller: the DBT-120 enumerates device
+ * class 0 / E0-interface, so the device-class test misses it; this file does not. Refresh
+ * promotes on it. */
+static Boolean LoadBattery(BTCsmState *st)
 {
     FSSpec        spec;
     short         vRefNum, ref;
@@ -340,14 +355,14 @@ static void LoadBattery(BTCsmState *st)
     short         i, count;
 
     if (FindFolder(kOnSystemDisk, kPreferencesFolderType, kDontCreateFolder,
-                   &vRefNum, &dirID) != noErr) return;
-    if (FSMakeFSSpec(vRefNum, dirID, "\pBluetooth Battery", &spec) != noErr) return;
-    if (!FileWrittenThisBoot(&spec)) return;      /* previous session: show nothing */
-    if (FSpOpenDF(&spec, fsRdPerm, &ref) != noErr) return;
+                   &vRefNum, &dirID) != noErr) return false;
+    if (FSMakeFSSpec(vRefNum, dirID, "\pBluetooth Battery", &spec) != noErr) return false;
+    if (!FileWrittenThisBoot(&spec)) return false;      /* previous session: show nothing */
+    if (FSpOpenDF(&spec, fsRdPerm, &ref) != noErr) return false;
 
     n = (long)sizeof(hdr);
-    if (FSRead(ref, &n, hdr) != noErr || n != (long)sizeof(hdr)) { FSClose(ref); return; }
-    if (hdr[0] != kBatMagic || hdr[1] != kBatFmtVer) { FSClose(ref); return; }
+    if (FSRead(ref, &n, hdr) != noErr || n != (long)sizeof(hdr)) { FSClose(ref); return false; }
+    if (hdr[0] != kBatMagic || hdr[1] != kBatFmtVer) { FSClose(ref); return false; }
     count = (short)hdr[2];
     if (count < 0) count = 0;
     for (i = 0; i < count && st->devCount < kMaxDev; i++) {
@@ -366,6 +381,7 @@ static void LoadBattery(BTCsmState *st)
         }
     }
     FSClose(ref);
+    return (count > 0);
 }
 
 /* ⭐ THE DEVICE'S OWN NAME, from the driver's names file. A real name ("Chris's
@@ -516,8 +532,58 @@ static short ScanBusState(void)
     return found;
 }
 
+/* ⭐ A FILE'S STAMP, from the catalog: modification date, data length, file number. ⚠ A
+ * catalog lookup, NOT a read, and that difference is the whole point -- see Refresh. */
+static void StampOne(short vRefNum, long dirID, ConstStr255Param name, unsigned long out[3])
+{
+    CInfoPBRec pb;
+    Str255     nm;
+
+    out[0] = out[1] = out[2] = 0;
+    BlockMoveData(name, nm, (Size)(name[0] + 1));
+    memset(&pb, 0, sizeof(pb));
+    pb.hFileInfo.ioNamePtr   = nm;
+    pb.hFileInfo.ioVRefNum   = vRefNum;
+    pb.hFileInfo.ioDirID     = dirID;
+    pb.hFileInfo.ioFDirIndex = 0;
+    if (PBGetCatInfoSync(&pb) != noErr) return;              /* absent: all zero */
+    out[0] = pb.hFileInfo.ioFlMdDat;
+    out[1] = (unsigned long)pb.hFileInfo.ioFlLgLen;
+    out[2] = (unsigned long)pb.hFileInfo.ioDirID;            /* for a file: its number */
+}
+
+/* All four stamps. FALSE if the Preferences folder cannot be found (then Refresh reads as
+ * before, and the loads fail the same way they always did). *young is TRUE when a file
+ * was modified within 2 s of now: a date has one-second granularity, so a second write
+ * in the same second would leave the stamp unchanged, and a young file is read again on
+ * the next refresh instead of being trusted. ⚠ The names are written out here rather than
+ * kept in a table: an initialised pointer array is data the strip's loader would have to
+ * relocate, and design note 1 says what a CSM's data section can cost. */
+static Boolean StampAll(unsigned long stamp[4][3], Boolean *young)
+{
+    short         vRefNum, i;
+    long          dirID;
+    unsigned long now;
+
+    memset(stamp, 0, sizeof(unsigned long) * 12);
+    *young = false;
+    if (FindFolder(kOnSystemDisk, kPreferencesFolderType, kDontCreateFolder,
+                   &vRefNum, &dirID) != noErr) return false;
+    StampOne(vRefNum, dirID, "\pBluetooth Device Kinds", stamp[0]);
+    StampOne(vRefNum, dirID, "\pBluetooth Battery",      stamp[1]);
+    StampOne(vRefNum, dirID, "\pBluetooth Device Names", stamp[2]);
+    StampOne(vRefNum, dirID, "\pBluetooth Nicknames",    stamp[3]);
+    GetDateTime(&now);
+    for (i = 0; i < 4; i++)
+        if (stamp[i][0] != 0 && stamp[i][0] + 2 >= now && stamp[i][0] <= now + 2) *young = true;
+    return true;
+}
+
 static void Refresh(BTCsmState *st)
 {
+    unsigned long stamp[4][3];
+    Boolean       young;
+
     if (st == NULL) return;
 
     /* The bus scan touches no disk, so state is always current. */
@@ -533,20 +599,53 @@ static void Refresh(BTCsmState *st)
      * flicker caused entirely by the refresh, not by anything changing. The previous
      * contents were validated when they were read and do not go stale within a
      * session; not re-reading them is not a reason to throw them away. */
-    if (!SBSafeToAccessStartupDisk()) return;
+    if (!SBSafeToAccessStartupDisk()) {
+        if (st->batLive && st->state != kStHCI) st->state = kStHCI;     /* (see below) */
+        return;
+    }
+
+    /* ⚠⚠ READ THE FILES ONLY WHEN ONE OF THEM CHANGED (idlefix1, 2026-11-15). Every FSRead
+     * reports system activity to the Power Manager (DelaySystemIdle; measured on the MDD's
+     * 9.2.2: ten reads, eleven reports), and each report gives the system-sleep timer 10 s
+     * back, at most once per 10 s. This module re-read its four files on every refresh,
+     * every ~5.85 s while the disk spun, so the timer gained ~1.7 s per 11.7 s instead of
+     * 11.7: on the FW800 MDD idle sleep came ~20 minutes after boot instead of 10, and only
+     * because the disk spinning down made SBSafeToAccessStartupDisk say no. Sleep
+     * Assistant's activity hook named it: ControlStripModule > Refresh > LoadDevices >
+     * FSRead > _Read > DelaySystemIdle, 50 of 51 pushes in the idle window
+     * (firewire-fw800 logs/uwake17A-hw-2026-11-15). A catalog lookup (PBGetCatInfoSync)
+     * reports nothing, so the four stamps are taken every refresh and the files are read
+     * only when a stamp moved, or a file is too young to trust its date. */
+    if (StampAll(stamp, &young) && !young && st->haveStamps
+        && memcmp(stamp, st->fileStamp, sizeof(stamp)) == 0) {
+        /* ⚠ Unchanged: keep the list and levels. LoadBattery's promotion is re-applied from
+         * the remembered answer, or a dongle the bus walk cannot classify would drop back
+         * to absent on every refresh after the first. */
+        if (st->batLive && st->state != kStHCI) st->state = kStHCI;
+        return;
+    }
 
     st->devCount = 0;
     LoadDevices(st);
-    /* ⭐ THE GAUGE IS GATED ON OUR STACK OWNING THE CARD. In proxy mode Mac OS is
-     * driving the keyboard and nothing of ours is asking for a level, so whatever is in
-     * the file is not about right now. See the header's first block. */
-    if (st->state == kStHCI) LoadBattery(st);
+    /* ⭐ THE GAUGE IS GATED ON "OUR STACK IS LIVE", NOT ON HARDWARE IDENTITY. LoadBattery
+     * self-gates on FileWrittenThisBoot, so a TRUE return means our BTstack held a live link
+     * this boot -- which promotes kStAbsent/kStProxy to kStHCI for a controller ScanBusState
+     * could not classify. The DBT-120 enumerates device class 0 (E0 on the interface), so the
+     * device-CLASS walk misses it; the battery file does not. In proxy mode the driver writes
+     * no battery file, so this stays false and kStProxy holds. (Was: gated on kStHCI from the
+     * USB walk alone, which blanked the gauge for any dongle the walk could not see.) */
+    st->batLive = LoadBattery(st);
+    if (st->batLive && st->state != kStHCI) st->state = kStHCI;
     /* ⚠ LAST, because it only annotates devices the two loads above have already
      * added -- a name is not a reason to list a device. */
     LoadNames(st);
     /* ⚠ AFTER LoadNames, never before: the user's own name must win over the one
      * the device supplies, and this simply overwrites it. */
     LoadNicknames(st);
+    /* The stamps taken BEFORE the reads: a file that changes during them leaves an older
+     * stamp, so the next refresh reads again (the safe direction). */
+    memcpy(st->fileStamp, stamp, sizeof(stamp));
+    st->haveStamps = (Boolean)!young;
 }
 
 /* ---- selection ----------------------------------------------------------- */
